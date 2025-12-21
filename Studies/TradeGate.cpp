@@ -1691,6 +1691,10 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 
 		InProgress = 1;
 
+		// Capture the chart price exactly at the click point before the menu opens
+		// so mouse movement while choosing a menu item does not shift the price.
+		const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
+
 		UINT cmd = ShowOrderMenu(hwnd);
 		if (cmd == CMD_NONE || cmd == CMD_CANCEL)
 		{
@@ -1701,8 +1705,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		s_SCNewOrder order{};
 		order.Price1 = 0.0; // avoid sentinel values if the backend inspects Price1 on market orders
 		order.OrderQuantity = GetOrderQuantity(sc);
-
-		const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
 
 		bool isBuy = false;
 		std::wstring orderSummary;
@@ -1723,7 +1725,7 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			case CMD_BUY_LIMIT:
 				isBuy = true;
 				order.OrderType = SCT_ORDERTYPE_LIMIT;
-				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Down);
+				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Nearest);
 				orderSummary = L"Order: Buy Limit @ " + formatPrice(order.Price1);
 				break;
 			case CMD_BUY_STOP:
