@@ -1,0 +1,46 @@
+[
+  {
+    "id": "setup",
+    "type": "text",
+    "label": "Setup",
+    "required": true,
+    "placeholder": "Configure the setup options here."
+  },
+  {
+    "id": "tilt",
+    "type": "checkbox",
+    "label": "Are you tilting?",
+    "required": true
+  },
+  {
+    "id": "tod_dropdown",
+    "type": "dropdown",
+    "label": "Time-of-day window?",
+    "required": true,
+    "options": ["London", "NY AM", "NY PM", "Off-hours"],
+    "default": "NY AM"
+  },
+  {
+    "id": "tod_radio",
+    "type": "radio",
+    "label": "Time-of-day window?",
+    "required": false,
+    "options": ["None", "London", "NY AM", "NY PM", "Off-hours"],
+    "default": "NY AM"
+  },
+  {
+    "id": "sessions",
+    "type": "multicheckbox",
+    "label": "Allowed sessions",
+    "required": false,
+    "options": ["London", "NY AM", "NY PM", "Off-hours"],
+    "default": ["NY AM", "London"]
+  },
+  {
+    "id": "notes",
+    "type": "textarea",
+    "label": "Notes (optional)",
+    "required": false,
+    "placeholder": "Reason, invalidation, target..."
+  }
+]

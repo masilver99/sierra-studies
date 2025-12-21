@@ -13,6 +13,15 @@
 #include <cmath>
 #include <string>
 
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <cwctype>
+#include <fstream>
+#include <sstream>
+#include <utility>
+#include <vector>
+
 #include <cstdint>
 
 SCDLLName("Trade Gate")
@@ -46,7 +55,7 @@ namespace
 				break;
 			case TickRounding::Nearest:
 			default:
-				scaled = std::llround(scaled);
+					scaled = std::round(scaled);
 				break;
 		}
 		return scaled * tickSize;
@@ -64,6 +73,8 @@ namespace
 		INPUT_CHECK_3_TEXT = 7,
 		INPUT_CHECK_4_TEXT = 8,
 		INPUT_FINAL_CONFIRM = 9,
+		INPUT_CONFIG_JSON_PATH = 10,
+		INPUT_DEBUG_LOG = 11,
 	};
 
 	enum MenuCommand : UINT
@@ -110,8 +121,8 @@ namespace
 		AppendMenuW(menu, MF_STRING, CMD_BUY_LIMIT, L"Buy Limit @ Click Price");
 		AppendMenuW(menu, MF_STRING, CMD_BUY_STOP, L"Buy Stop @ Click Price");
 		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-		AppendMenuW(menu, MF_STRING, CMD_SELL_MARKET, L"Sell Market");
 		AppendMenuW(menu, MF_STRING, CMD_SELL_LIMIT, L"Sell Limit @ Click Price");
+		AppendMenuW(menu, MF_STRING, CMD_SELL_MARKET, L"Sell Market");
 		AppendMenuW(menu, MF_STRING, CMD_SELL_STOP, L"Sell Stop @ Click Price");
 		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 		AppendMenuW(menu, MF_STRING, CMD_CANCEL, L"Cancel");
@@ -145,8 +156,30 @@ namespace
 	{
 		const wchar_t* title = L"Trade Gate Checklist";
 		bool finalConfirm = false;
-		std::wstring q[4];
-		int qCount = 0;
+
+		struct Item
+		{
+			enum class Type
+			{
+				Checkbox,
+				Radio,
+				Dropdown,
+				Text,
+				TextArea,
+				MultiCheckbox,
+			};
+
+			std::wstring id;
+			Type type = Type::Checkbox;
+			std::wstring label;
+			bool required = false;
+			std::wstring placeholder;
+			std::vector<std::wstring> options;
+			std::wstring defaultValue;
+			std::vector<std::wstring> defaultValues;
+		};
+
+		std::vector<Item> items;
 	};
 
 	static bool RunChecklistCheckboxDialog(HWND parent, const ChecklistDialogParams& params);
@@ -182,6 +215,579 @@ namespace
 		out.resize((size_t)needed - 1);
 		MultiByteToWideChar(codePage, flags, chars, -1, out.data(), needed);
 		return out;
+	}
+
+	static std::wstring ToWideBestEffort(const std::string& s)
+	{
+		if (s.empty())
+			return {};
+		int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), -1, nullptr, 0);
+		UINT codePage = CP_UTF8;
+		DWORD flags = MB_ERR_INVALID_CHARS;
+		if (needed <= 0)
+		{
+			codePage = CP_ACP;
+			flags = 0;
+			needed = MultiByteToWideChar(codePage, flags, s.c_str(), -1, nullptr, 0);
+		}
+		if (needed <= 0)
+			return {};
+
+		std::wstring out;
+		out.resize((size_t)needed - 1);
+		MultiByteToWideChar(codePage, flags, s.c_str(), -1, out.data(), needed);
+		return out;
+	}
+
+	static std::wstring GetThisModuleDirectory()
+	{
+		HMODULE hMod = nullptr;
+		if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&GetThisModuleDirectory),
+			&hMod))
+		{
+			return {};
+		}
+
+		wchar_t path[MAX_PATH]{};
+		DWORD len = GetModuleFileNameW(hMod, path, (DWORD)_countof(path));
+		if (len == 0 || len >= _countof(path))
+			return {};
+		std::wstring p(path, path + len);
+		size_t pos = p.find_last_of(L"\\/");
+		if (pos == std::wstring::npos)
+			return {};
+		p.resize(pos);
+		return p;
+	}
+
+	static bool IsAbsolutePath(const std::wstring& p)
+	{
+		if (p.size() >= 2 && std::iswalpha(p[0]) && p[1] == L':')
+			return true;
+		if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\')
+			return true;
+		return false;
+	}
+
+	static std::wstring ResolveConfigPathRelativeToModule(const std::wstring& input)
+	{
+		std::wstring trimmed = input;
+		while (!trimmed.empty() && (trimmed.front() == L' ' || trimmed.front() == L'\t' || trimmed.front() == L'\r' || trimmed.front() == L'\n'))
+			trimmed.erase(trimmed.begin());
+		while (!trimmed.empty() && (trimmed.back() == L' ' || trimmed.back() == L'\t' || trimmed.back() == L'\r' || trimmed.back() == L'\n'))
+			trimmed.pop_back();
+		if (trimmed.empty())
+			return {};
+		if (IsAbsolutePath(trimmed))
+			return trimmed;
+		std::wstring base = GetThisModuleDirectory();
+		if (base.empty())
+			return trimmed;
+		if (!base.empty() && base.back() != L'\\')
+			base += L'\\';
+		return base + trimmed;
+	}
+
+	static bool ReadFileUtf8(const std::wstring& path, std::string& out)
+	{
+		out.clear();
+		std::ifstream f(path, std::ios::binary);
+		if (!f)
+			return false;
+		std::ostringstream ss;
+		ss << f.rdbuf();
+		out = ss.str();
+		// strip UTF-8 BOM if present
+		if (out.size() >= 3 && (unsigned char)out[0] == 0xEF && (unsigned char)out[1] == 0xBB && (unsigned char)out[2] == 0xBF)
+			out.erase(0, 3);
+		return true;
+	}
+
+	static std::string StripJsonCommentsAndTrailingCommas(const std::string& input)
+	{
+		std::string noComments;
+		noComments.reserve(input.size());
+		bool inString = false;
+		bool escape = false;
+		for (size_t i = 0; i < input.size(); ++i)
+		{
+			const char c = input[i];
+			const char next = (i + 1 < input.size()) ? input[i + 1] : '\0';
+
+			if (inString)
+			{
+				noComments.push_back(c);
+				if (escape)
+				{
+					escape = false;
+					continue;
+				}
+				if (c == '\\')
+				{
+					escape = true;
+					continue;
+				}
+				if (c == '"')
+					inString = false;
+				continue;
+			}
+
+			if (c == '"')
+			{
+				inString = true;
+				noComments.push_back(c);
+				continue;
+			}
+
+			// line comment
+			if (c == '/' && next == '/')
+			{
+				i += 1;
+				while (i + 1 < input.size() && input[i + 1] != '\n')
+					i += 1;
+				continue;
+			}
+			// block comment
+			if (c == '/' && next == '*')
+			{
+				i += 1;
+				while (i + 1 < input.size())
+				{
+					if (input[i] == '*' && input[i + 1] == '/')
+					{
+						i += 1;
+						break;
+					}
+					i += 1;
+				}
+				continue;
+			}
+
+			noComments.push_back(c);
+		}
+
+		// remove trailing commas before } or ] (while respecting strings)
+		std::string out;
+		out.reserve(noComments.size());
+		inString = false;
+		escape = false;
+		for (size_t i = 0; i < noComments.size(); ++i)
+		{
+			const char c = noComments[i];
+			if (inString)
+			{
+				out.push_back(c);
+				if (escape)
+				{
+					escape = false;
+					continue;
+				}
+				if (c == '\\')
+				{
+					escape = true;
+					continue;
+				}
+				if (c == '"')
+					inString = false;
+				continue;
+			}
+			if (c == '"')
+			{
+				inString = true;
+				out.push_back(c);
+				continue;
+			}
+
+			if (c == ',')
+			{
+				// look ahead for next non-whitespace
+				size_t j = i + 1;
+				while (j < noComments.size() && (noComments[j] == ' ' || noComments[j] == '\t' || noComments[j] == '\r' || noComments[j] == '\n'))
+					++j;
+				if (j < noComments.size() && (noComments[j] == ']' || noComments[j] == '}'))
+					continue;
+			}
+
+			out.push_back(c);
+		}
+		return out;
+	}
+
+	struct JsonValue
+	{
+		enum class Type
+		{
+			Null,
+			Bool,
+			String,
+			Array,
+			Object,
+		};
+		Type type = Type::Null;
+		bool b = false;
+		std::string s;
+		std::vector<JsonValue> a;
+		std::vector<std::pair<std::string, JsonValue>> o;
+
+		const JsonValue* Find(const char* key) const
+		{
+			if (type != Type::Object)
+				return nullptr;
+			for (const auto& kv : o)
+			{
+				if (_stricmp(kv.first.c_str(), key) == 0)
+					return &kv.second;
+			}
+			return nullptr;
+		}
+	};
+
+	struct JsonParser
+	{
+		const char* p = nullptr;
+		const char* end = nullptr;
+		std::string error;
+
+		explicit JsonParser(const std::string& text)
+			: p(text.c_str())
+			, end(text.c_str() + text.size())
+		{
+		}
+
+		void SkipWs()
+		{
+			while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+				++p;
+		}
+
+		bool Match(char c)
+		{
+			SkipWs();
+			if (p < end && *p == c)
+			{
+				++p;
+				return true;
+			}
+			return false;
+		}
+
+		bool Expect(char c, const char* what)
+		{
+			if (Match(c))
+				return true;
+			error = what;
+			return false;
+		}
+
+		bool ParseString(std::string& out)
+		{
+			SkipWs();
+			if (p >= end || *p != '"')
+			{
+				error = "Expected string";
+				return false;
+			}
+			++p;
+			std::string s;
+			while (p < end)
+			{
+				char c = *p++;
+				if (c == '"')
+				{
+					out = std::move(s);
+					return true;
+				}
+				if (c == '\\')
+				{
+					if (p >= end)
+					{
+						error = "Unterminated escape";
+						return false;
+					}
+					char e = *p++;
+					switch (e)
+					{
+						case '"': s.push_back('"'); break;
+						case '\\': s.push_back('\\'); break;
+						case '/': s.push_back('/'); break;
+						case 'b': s.push_back('\b'); break;
+						case 'f': s.push_back('\f'); break;
+						case 'n': s.push_back('\n'); break;
+						case 'r': s.push_back('\r'); break;
+						case 't': s.push_back('\t'); break;
+						case 'u':
+						{
+							unsigned v = 0;
+							for (int i = 0; i < 4; ++i)
+							{
+								if (p >= end)
+								{
+									error = "Bad unicode escape";
+									return false;
+								}
+								char h = *p++;
+								v <<= 4;
+								if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+								else if (h >= 'a' && h <= 'f') v |= (unsigned)(10 + h - 'a');
+								else if (h >= 'A' && h <= 'F') v |= (unsigned)(10 + h - 'A');
+								else
+								{
+									error = "Bad unicode hex";
+									return false;
+								}
+							}
+							if (v <= 0x7F)
+								s.push_back((char)v);
+							else
+								s.push_back('?');
+							break;
+						}
+						default:
+							error = "Unknown escape";
+							return false;
+					}
+					continue;
+				}
+				s.push_back(c);
+			}
+			error = "Unterminated string";
+			return false;
+		}
+
+		bool ParseValue(JsonValue& out)
+		{
+			SkipWs();
+			if (p >= end)
+			{
+				error = "Unexpected end";
+				return false;
+			}
+			if (*p == '"')
+			{
+				out.type = JsonValue::Type::String;
+				return ParseString(out.s);
+			}
+			if (*p == '{')
+				return ParseObject(out);
+			if (*p == '[')
+				return ParseArray(out);
+			if (end - p >= 4 && std::strncmp(p, "true", 4) == 0)
+			{
+				p += 4;
+				out.type = JsonValue::Type::Bool;
+				out.b = true;
+				return true;
+			}
+			if (end - p >= 5 && std::strncmp(p, "false", 5) == 0)
+			{
+				p += 5;
+				out.type = JsonValue::Type::Bool;
+				out.b = false;
+				return true;
+			}
+			if (end - p >= 4 && std::strncmp(p, "null", 4) == 0)
+			{
+				p += 4;
+				out.type = JsonValue::Type::Null;
+				return true;
+			}
+			error = "Unexpected token";
+			return false;
+		}
+
+		bool ParseArray(JsonValue& out)
+		{
+			out = JsonValue{};
+			out.type = JsonValue::Type::Array;
+			if (!Expect('[', "Expected '['"))
+				return false;
+			SkipWs();
+			if (Match(']'))
+				return true;
+			while (p < end)
+			{
+				JsonValue v;
+				if (!ParseValue(v))
+					return false;
+				out.a.push_back(std::move(v));
+				SkipWs();
+				if (Match(']'))
+					return true;
+				if (!Expect(',', "Expected ','"))
+					return false;
+			}
+			error = "Unterminated array";
+			return false;
+		}
+
+		bool ParseObject(JsonValue& out)
+		{
+			out = JsonValue{};
+			out.type = JsonValue::Type::Object;
+			if (!Expect('{', "Expected '{'"))
+				return false;
+			SkipWs();
+			if (Match('}'))
+				return true;
+			while (p < end)
+			{
+				std::string key;
+				if (!ParseString(key))
+					return false;
+				if (!Expect(':', "Expected ':'"))
+					return false;
+				JsonValue v;
+				if (!ParseValue(v))
+					return false;
+				out.o.emplace_back(std::move(key), std::move(v));
+				SkipWs();
+				if (Match('}'))
+					return true;
+				if (!Expect(',', "Expected ','"))
+					return false;
+			}
+			error = "Unterminated object";
+			return false;
+		}
+	};
+
+	static bool ParseChecklistJson(const std::string& jsonText, ChecklistDialogParams& outParams, std::wstring& outError)
+	{
+		outError.clear();
+		std::string cleaned = StripJsonCommentsAndTrailingCommas(jsonText);
+		JsonParser parser(cleaned);
+		JsonValue root;
+		if (!parser.ParseValue(root))
+		{
+			outError = ToWideBestEffort(parser.error);
+			return false;
+		}
+		parser.SkipWs();
+		if (parser.p != parser.end)
+		{
+			outError = L"Extra data after JSON";
+			return false;
+		}
+		if (root.type != JsonValue::Type::Array)
+		{
+			outError = L"Root must be an array";
+			return false;
+		}
+
+		outParams.items.clear();
+		std::vector<std::wstring> ids;
+
+		auto toLower = [](std::string s)
+		{
+			for (char& c : s)
+				c = (char)std::tolower((unsigned char)c);
+			return s;
+		};
+
+		for (const JsonValue& elem : root.a)
+		{
+			if (elem.type != JsonValue::Type::Object)
+				continue;
+			const JsonValue* idv = elem.Find("id");
+			const JsonValue* typev = elem.Find("type");
+			const JsonValue* labelv = elem.Find("label");
+			if (idv == nullptr || idv->type != JsonValue::Type::String)
+				continue;
+			if (typev == nullptr || typev->type != JsonValue::Type::String)
+				continue;
+			if (labelv == nullptr || labelv->type != JsonValue::Type::String)
+				continue;
+
+			ChecklistDialogParams::Item item;
+			item.id = ToWideBestEffort(idv->s);
+			item.label = ToWideBestEffort(labelv->s);
+			if (item.id.empty() || item.label.empty())
+				continue;
+
+			for (const auto& existing : ids)
+			{
+				if (_wcsicmp(existing.c_str(), item.id.c_str()) == 0)
+				{
+					outError = L"Duplicate id in checklist JSON: ";
+					outError += item.id;
+					return false;
+				}
+			}
+			ids.push_back(item.id);
+
+			std::string t = toLower(typev->s);
+			if (t == "checkbox") item.type = ChecklistDialogParams::Item::Type::Checkbox;
+			else if (t == "radio") item.type = ChecklistDialogParams::Item::Type::Radio;
+			else if (t == "dropdown") item.type = ChecklistDialogParams::Item::Type::Dropdown;
+			else if (t == "text") item.type = ChecklistDialogParams::Item::Type::Text;
+			else if (t == "textarea") item.type = ChecklistDialogParams::Item::Type::TextArea;
+			else if (t == "multicheckbox") item.type = ChecklistDialogParams::Item::Type::MultiCheckbox;
+			else
+				continue;
+
+			const JsonValue* reqv = elem.Find("required");
+			if (reqv != nullptr && reqv->type == JsonValue::Type::Bool)
+				item.required = reqv->b;
+
+			const JsonValue* phv = elem.Find("placeholder");
+			if (phv != nullptr && phv->type == JsonValue::Type::String)
+				item.placeholder = ToWideBestEffort(phv->s);
+
+			const JsonValue* optv = elem.Find("options");
+			if (optv != nullptr && optv->type == JsonValue::Type::Array)
+			{
+				for (const JsonValue& ov : optv->a)
+				{
+					if (ov.type == JsonValue::Type::String)
+					{
+						std::wstring w = ToWideBestEffort(ov.s);
+						if (!w.empty())
+							item.options.push_back(std::move(w));
+					}
+				}
+			}
+
+			const JsonValue* defv = elem.Find("default");
+			if (defv != nullptr)
+			{
+				if (defv->type == JsonValue::Type::String)
+					item.defaultValue = ToWideBestEffort(defv->s);
+				else if (defv->type == JsonValue::Type::Array)
+				{
+					for (const JsonValue& dv : defv->a)
+					{
+						if (dv.type == JsonValue::Type::String)
+						{
+							std::wstring w = ToWideBestEffort(dv.s);
+							if (!w.empty())
+								item.defaultValues.push_back(std::move(w));
+						}
+					}
+				}
+			}
+
+			// Basic schema validation for option-based types.
+			if ((item.type == ChecklistDialogParams::Item::Type::Dropdown
+				|| item.type == ChecklistDialogParams::Item::Type::Radio
+				|| item.type == ChecklistDialogParams::Item::Type::MultiCheckbox)
+				&& item.options.empty())
+			{
+				outError = L"Item requires non-empty options array: ";
+				outError += item.id;
+				return false;
+			}
+
+			outParams.items.push_back(std::move(item));
+		}
+
+		if (outParams.items.empty())
+		{
+			outError = L"No valid checklist items found";
+			return false;
+		}
+		return true;
 	}
 
 	static bool AskYesNoDetailed(
@@ -249,6 +855,39 @@ namespace
 		if (!sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo())
 			return true;
 
+		const SCString jsonPathIn = sc.Input[INPUT_CONFIG_JSON_PATH].GetString();
+		if (!jsonPathIn.IsEmpty())
+		{
+			ChecklistDialogParams params;
+			params.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
+			std::wstring jsonPath = ResolveConfigPathRelativeToModule(ToWideBestEffort(jsonPathIn));
+			std::string fileText;
+			if (!ReadFileUtf8(jsonPath, fileText))
+			{
+				SCString msg;
+				msg.Format("Trade Gate: Could not read checklist JSON file: %s", jsonPathIn.GetChars());
+				sc.AddMessageToLog(msg, 1);
+				MessageBoxW(hwnd, (L"Could not read checklist JSON file:\r\n" + jsonPath).c_str(), L"Trade Gate", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+				return false;
+			}
+
+			std::wstring parseError;
+			if (!ParseChecklistJson(fileText, params, parseError))
+			{
+				std::wstring msg = L"Checklist JSON parse/validation failed.";
+				if (!parseError.empty())
+				{
+					msg += L"\r\n\r\n";
+					msg += parseError;
+				}
+				MessageBoxW(hwnd, msg.c_str(), L"Trade Gate", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+				sc.AddMessageToLog("Trade Gate: Checklist JSON parse/validation failed.", 1);
+				return false;
+			}
+
+			return RunChecklistCheckboxDialog(hwnd, params);
+		}
+
 		const SCString q1 = sc.Input[INPUT_CHECK_1_TEXT].GetString();
 		const SCString q2 = sc.Input[INPUT_CHECK_2_TEXT].GetString();
 		const SCString q3 = sc.Input[INPUT_CHECK_3_TEXT].GetString();
@@ -257,23 +896,27 @@ namespace
 		ChecklistDialogParams params;
 		params.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
 
-		auto addQuestion = [&](const SCString& q)
+		auto addLegacyCheckbox = [&](const wchar_t* id, const SCString& q)
 		{
 			if (q.IsEmpty())
 				return;
 			std::wstring w = ToWideBestEffort(q);
 			if (w.empty())
 				return;
-			if (params.qCount < 4)
-				params.q[params.qCount++] = std::move(w);
+			ChecklistDialogParams::Item item;
+			item.id = id;
+			item.type = ChecklistDialogParams::Item::Type::Checkbox;
+			item.label = std::move(w);
+			item.required = true;
+			params.items.push_back(std::move(item));
 		};
 
-		addQuestion(q1);
-		addQuestion(q2);
-		addQuestion(q3);
-		addQuestion(q4);
+		addLegacyCheckbox(L"q1", q1);
+		addLegacyCheckbox(L"q2", q2);
+		addLegacyCheckbox(L"q3", q3);
+		addLegacyCheckbox(L"q4", q4);
 
-		if (params.qCount == 0)
+		if (params.items.empty())
 		{
 			if (!params.finalConfirm)
 				return true;
@@ -286,9 +929,22 @@ namespace
 	namespace
 	{
 		constexpr UINT IDC_CHECKLIST_MAIN_TEXT = 3001;
-		constexpr UINT IDC_CHECKLIST_Q_BASE = 3100;
+		constexpr UINT IDC_CHECKLIST_DYNAMIC_BASE = 3100;
 		constexpr UINT IDC_CHECKLIST_OK = IDOK;
 		constexpr UINT IDC_CHECKLIST_CANCEL = IDCANCEL;
+
+		struct ChecklistDialogRuntime
+		{
+			ChecklistDialogParams* params = nullptr;
+			struct ControlRef
+			{
+				ChecklistDialogParams::Item::Type type;
+				bool required = false;
+				UINT idFirst = 0;
+				int optionCount = 0;
+			};
+			std::vector<ControlRef> controls;
+		};
 
 		static void ResizeDialogToClient(HWND hDlg, int clientWidth, int clientHeight)
 		{
@@ -341,34 +997,96 @@ namespace
 			return h;
 		}
 
-		static void UpdateChecklistOkEnabled(HWND hDlg, int qCount)
+		static void UpdateChecklistOkEnabled(HWND hDlg)
 		{
-			bool allChecked = true;
-			for (int i = 0; i < qCount; ++i)
+			auto* runtime = reinterpret_cast<ChecklistDialogRuntime*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+			bool ok = true;
+			if (runtime != nullptr)
 			{
-				HWND hCheck = GetDlgItem(hDlg, (int)IDC_CHECKLIST_Q_BASE + i);
-				if (hCheck == nullptr)
-					continue;
-				if (SendMessageW(hCheck, BM_GETCHECK, 0, 0) != BST_CHECKED)
+				for (const auto& c : runtime->controls)
 				{
-					allChecked = false;
-					break;
+					if (!c.required)
+						continue;
+					bool satisfied = true;
+					switch (c.type)
+					{
+						case ChecklistDialogParams::Item::Type::Checkbox:
+						{
+							HWND h = GetDlgItem(hDlg, (int)c.idFirst);
+							satisfied = (h != nullptr && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED);
+							break;
+						}
+						case ChecklistDialogParams::Item::Type::Text:
+						case ChecklistDialogParams::Item::Type::TextArea:
+						{
+							HWND h = GetDlgItem(hDlg, (int)c.idFirst);
+							int len = 0;
+							if (h != nullptr)
+								len = GetWindowTextLengthW(h);
+							satisfied = (len > 0);
+							break;
+						}
+						case ChecklistDialogParams::Item::Type::Dropdown:
+						{
+							HWND h = GetDlgItem(hDlg, (int)c.idFirst);
+							LRESULT sel = (h != nullptr) ? SendMessageW(h, CB_GETCURSEL, 0, 0) : (LRESULT)CB_ERR;
+							satisfied = (sel != CB_ERR);
+							break;
+						}
+						case ChecklistDialogParams::Item::Type::Radio:
+						{
+							satisfied = false;
+							for (int i = 0; i < c.optionCount; ++i)
+							{
+								HWND h = GetDlgItem(hDlg, (int)c.idFirst + i);
+								if (h != nullptr && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED)
+								{
+									satisfied = true;
+									break;
+								}
+							}
+							break;
+						}
+						case ChecklistDialogParams::Item::Type::MultiCheckbox:
+						{
+							satisfied = false;
+							for (int i = 0; i < c.optionCount; ++i)
+							{
+								HWND h = GetDlgItem(hDlg, (int)c.idFirst + i);
+								if (h != nullptr && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED)
+								{
+									satisfied = true;
+									break;
+								}
+							}
+							break;
+						}
+						default:
+							break;
+					}
+					if (!satisfied)
+					{
+						ok = false;
+						break;
+					}
 				}
 			}
 			HWND hOk = GetDlgItem(hDlg, IDC_CHECKLIST_OK);
 			if (hOk != nullptr)
-				EnableWindow(hOk, allChecked ? TRUE : FALSE);
+				EnableWindow(hOk, ok ? TRUE : FALSE);
 		}
 
 		static INT_PTR CALLBACK ChecklistDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 		{
-			ChecklistDialogParams* params = reinterpret_cast<ChecklistDialogParams*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+			auto* runtime = reinterpret_cast<ChecklistDialogRuntime*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+			ChecklistDialogParams* params = runtime != nullptr ? runtime->params : nullptr;
 			switch (msg)
 			{
 				case WM_INITDIALOG:
 				{
-					params = reinterpret_cast<ChecklistDialogParams*>(lParam);
-					SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)params);
+					runtime = reinterpret_cast<ChecklistDialogRuntime*>(lParam);
+					SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)runtime);
+					params = runtime != nullptr ? runtime->params : nullptr;
 					if (params != nullptr && params->title != nullptr)
 						SetWindowTextW(hDlg, params->title);
 
@@ -377,7 +1095,7 @@ namespace
 					const int buttonWidth = 110;
 					const int buttonHeight = 28;
 					const int buttonGap = 10;
-					const int minClientWidth = 460;
+					const int minClientWidth = 520;
 
 					RECT rcClient{};
 					GetClientRect(hDlg, &rcClient);
@@ -391,7 +1109,6 @@ namespace
 
 					HDC hdc = GetDC(hDlg);
 					const int textW = clientW - margin * 2;
-					const int checkboxTextW = textW - 26; // approx checkbox box + padding
 
 					const wchar_t* mainText = (params != nullptr && params->finalConfirm)
 						? L"Check each item, then submit the order."
@@ -399,24 +1116,64 @@ namespace
 					int mainH = MeasureWrappedTextHeight(hdc, dlgFont, mainText, textW);
 					if (mainH < 18) mainH = 18;
 
-					int qCount = params != nullptr ? params->qCount : 0;
 					int contentH = 0;
-					for (int i = 0; i < qCount; ++i)
+					if (params != nullptr)
 					{
-						const std::wstring& q = params->q[i];
-						int qh = MeasureWrappedTextHeight(hdc, dlgFont, q.c_str(), checkboxTextW);
-						// ensure room for checkbox and focus rect
-						qh += 8;
-						if (qh < 22) qh = 22;
-						contentH += qh;
-						contentH += 6;
+						for (const auto& item : params->items)
+						{
+							int labelH = MeasureWrappedTextHeight(hdc, dlgFont, item.label.c_str(), textW);
+							if (labelH < 18) labelH = 18;
+
+							switch (item.type)
+							{
+								case ChecklistDialogParams::Item::Type::Checkbox:
+								{
+									int h = labelH + 8;
+									if (h < 22) h = 22;
+									contentH += h + 8;
+									break;
+								}
+								case ChecklistDialogParams::Item::Type::Text:
+								{
+									contentH += labelH + 6;
+									contentH += 26 + 10;
+									break;
+								}
+								case ChecklistDialogParams::Item::Type::TextArea:
+								{
+									contentH += labelH + 6;
+									contentH += 88 + 10;
+									break;
+								}
+								case ChecklistDialogParams::Item::Type::Dropdown:
+								{
+									contentH += labelH + 6;
+									contentH += 28 + 10;
+									break;
+								}
+								case ChecklistDialogParams::Item::Type::Radio:
+								case ChecklistDialogParams::Item::Type::MultiCheckbox:
+								{
+									contentH += labelH + 6;
+									for (const auto& opt : item.options)
+									{
+										int oh = MeasureWrappedTextHeight(hdc, dlgFont, opt.c_str(), textW - 26);
+										oh += 8;
+										if (oh < 22) oh = 22;
+										contentH += oh + 4;
+									}
+									contentH += 6;
+									break;
+								}
+								default:
+									break;
+							}
+						}
 					}
-					if (contentH > 0)
-						contentH -= 6;
 
 					ReleaseDC(hDlg, hdc);
 
-					const int desiredClientH = margin + mainH + 10 + contentH + 14 + buttonHeight + margin;
+					const int desiredClientH = margin + mainH + 10 + contentH + 8 + buttonHeight + margin;
 					ResizeDialogToClient(hDlg, clientW, desiredClientH);
 					CenterDialogOverParent(hDlg, GetParent(hDlg));
 
@@ -442,34 +1199,209 @@ namespace
 
 					y += mainH + 10;
 
+					UINT nextId = IDC_CHECKLIST_DYNAMIC_BASE;
+					runtime->controls.clear();
 					hdc = GetDC(hDlg);
-					for (int i = 0; i < qCount; ++i)
+					if (params != nullptr)
 					{
-						const std::wstring& q = params->q[i];
-						int qh = MeasureWrappedTextHeight(hdc, dlgFont, q.c_str(), width - 26);
-						qh += 8;
-						if (qh < 22) qh = 22;
+						for (const auto& item : params->items)
+						{
+							int labelH = MeasureWrappedTextHeight(hdc, dlgFont, item.label.c_str(), width);
+							if (labelH < 18) labelH = 18;
 
-						HWND hCheck = CreateWindowExW(
-							0,
-							L"BUTTON",
-							q.c_str(),
-							WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX | BS_MULTILINE,
-							margin,
-							y,
-							width,
-							qh,
-							hDlg,
-							(HMENU)(uintptr_t)((int)IDC_CHECKLIST_Q_BASE + i),
-							GetModuleHandleW(nullptr),
-							nullptr);
-						if (hCheck != nullptr)
-							SendMessageW(hCheck, WM_SETFONT, (WPARAM)dlgFont, TRUE);
-						y += qh + 6;
+							if (item.type == ChecklistDialogParams::Item::Type::Checkbox)
+							{
+								int qh = labelH + 8;
+								if (qh < 22) qh = 22;
+								UINT id = nextId++;
+								HWND hCheck = CreateWindowExW(
+									0,
+									L"BUTTON",
+									item.label.c_str(),
+									WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX | BS_MULTILINE,
+									margin,
+									y,
+									width,
+									qh,
+									hDlg,
+									(HMENU)(uintptr_t)id,
+									GetModuleHandleW(nullptr),
+									nullptr);
+								if (hCheck != nullptr)
+								{
+									SendMessageW(hCheck, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+									if (!item.defaultValue.empty())
+										SendMessageW(hCheck, BM_SETCHECK, (WPARAM)BST_CHECKED, 0);
+								}
+								runtime->controls.push_back({item.type, item.required, id, 1});
+								y += qh + 8;
+								continue;
+							}
+
+							// label static
+							HWND hLabel = CreateWindowExW(
+								0,
+								L"STATIC",
+								item.label.c_str(),
+								WS_CHILD | WS_VISIBLE,
+								margin,
+								y,
+								width,
+								labelH,
+								hDlg,
+								(HMENU)(uintptr_t)(nextId++),
+								GetModuleHandleW(nullptr),
+								nullptr);
+							if (hLabel != nullptr)
+								SendMessageW(hLabel, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+							y += labelH + 6;
+
+							switch (item.type)
+							{
+								case ChecklistDialogParams::Item::Type::Text:
+								case ChecklistDialogParams::Item::Type::TextArea:
+								{
+									UINT id = nextId++;
+									DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER;
+									int h = 26;
+									if (item.type == ChecklistDialogParams::Item::Type::Text)
+										style |= ES_AUTOHSCROLL;
+									else
+									{
+										style |= ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL;
+										h = 88;
+									}
+									HWND hEdit = CreateWindowExW(
+										0,
+										L"EDIT",
+										item.defaultValue.c_str(),
+										style,
+										margin,
+										y,
+										width,
+										h,
+										hDlg,
+										(HMENU)(uintptr_t)id,
+										GetModuleHandleW(nullptr),
+										nullptr);
+									if (hEdit != nullptr)
+									{
+										SendMessageW(hEdit, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+										if (!item.placeholder.empty())
+											SendMessageW(hEdit, EM_SETCUEBANNER, (WPARAM)TRUE, (LPARAM)item.placeholder.c_str());
+									}
+									runtime->controls.push_back({item.type, item.required, id, 1});
+									y += h + 10;
+									break;
+								}
+								case ChecklistDialogParams::Item::Type::Dropdown:
+								{
+									UINT id = nextId++;
+									HWND hCombo = CreateWindowExW(
+										0,
+										L"COMBOBOX",
+										L"",
+										WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+										margin,
+										y,
+										width,
+										200,
+										hDlg,
+										(HMENU)(uintptr_t)id,
+										GetModuleHandleW(nullptr),
+										nullptr);
+									if (hCombo != nullptr)
+									{
+										SendMessageW(hCombo, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+										for (const auto& opt : item.options)
+											SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)opt.c_str());
+										if (!item.defaultValue.empty())
+										{
+											for (int i = 0; i < (int)item.options.size(); ++i)
+											{
+												if (_wcsicmp(item.options[i].c_str(), item.defaultValue.c_str()) == 0)
+												{
+													SendMessageW(hCombo, CB_SETCURSEL, (WPARAM)i, 0);
+													break;
+												}
+											}
+										}
+									}
+									runtime->controls.push_back({item.type, item.required, id, 1});
+									y += 28 + 10;
+									break;
+								}
+								case ChecklistDialogParams::Item::Type::Radio:
+								case ChecklistDialogParams::Item::Type::MultiCheckbox:
+								{
+									UINT first = nextId;
+									int optCount = (int)item.options.size();
+									for (int i = 0; i < optCount; ++i)
+									{
+										const auto& opt = item.options[i];
+										int oh = MeasureWrappedTextHeight(hdc, dlgFont, opt.c_str(), width - 26);
+										oh += 8;
+										if (oh < 22) oh = 22;
+										DWORD st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_MULTILINE;
+										if (i == 0)
+											st |= WS_GROUP;
+										if (item.type == ChecklistDialogParams::Item::Type::Radio)
+											st |= BS_AUTORADIOBUTTON;
+										else
+											st |= BS_AUTOCHECKBOX;
+										UINT id = nextId++;
+										HWND hBtn = CreateWindowExW(
+											0,
+											L"BUTTON",
+											opt.c_str(),
+											st,
+											margin,
+											y,
+											width,
+											oh,
+											hDlg,
+											(HMENU)(uintptr_t)id,
+											GetModuleHandleW(nullptr),
+											nullptr);
+										if (hBtn != nullptr)
+											SendMessageW(hBtn, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+
+										bool doCheck = false;
+										if (item.type == ChecklistDialogParams::Item::Type::Radio)
+										{
+											if (!item.defaultValue.empty() && _wcsicmp(opt.c_str(), item.defaultValue.c_str()) == 0)
+												doCheck = true;
+											else if (item.defaultValue.empty() && i == 0)
+												doCheck = false;
+										}
+										else
+										{
+											for (const auto& dv : item.defaultValues)
+											{
+												if (_wcsicmp(opt.c_str(), dv.c_str()) == 0)
+												{
+													doCheck = true;
+													break;
+												}
+											}
+										}
+										if (doCheck)
+											SendMessageW(hBtn, BM_SETCHECK, (WPARAM)BST_CHECKED, 0);
+
+										y += oh + 4;
+									}
+									runtime->controls.push_back({item.type, item.required, first, optCount});
+									y += 6;
+									break;
+								}
+								default:
+									break;
+							}
+						}
 					}
 					ReleaseDC(hDlg, hdc);
 
-					y += 14;
+					y += 6;
 					const int buttonsY = (rcClient.bottom - rcClient.top) - margin - buttonHeight;
 					const int buttonsRight = (rcClient.right - rcClient.left) - margin;
 					const wchar_t* okText = (params != nullptr && params->finalConfirm) ? L"Submit" : L"Proceed";
@@ -506,7 +1438,7 @@ namespace
 					if (hCancel != nullptr)
 						SendMessageW(hCancel, WM_SETFONT, (WPARAM)dlgFont, TRUE);
 
-					UpdateChecklistOkEnabled(hDlg, qCount);
+					UpdateChecklistOkEnabled(hDlg);
 					return TRUE;
 				}
 
@@ -521,8 +1453,7 @@ namespace
 					}
 					if (id == IDC_CHECKLIST_OK)
 					{
-						int qCount = params != nullptr ? params->qCount : 0;
-						UpdateChecklistOkEnabled(hDlg, qCount);
+						UpdateChecklistOkEnabled(hDlg);
 						HWND hOk = GetDlgItem(hDlg, IDC_CHECKLIST_OK);
 						if (hOk != nullptr && IsWindowEnabled(hOk))
 						{
@@ -531,11 +1462,9 @@ namespace
 						}
 						return TRUE;
 					}
-
-					if (id >= IDC_CHECKLIST_Q_BASE && id < IDC_CHECKLIST_Q_BASE + 4 && code == BN_CLICKED)
+					if (code == BN_CLICKED || code == EN_CHANGE || code == CBN_SELCHANGE)
 					{
-						int qCount = params != nullptr ? params->qCount : 0;
-						UpdateChecklistOkEnabled(hDlg, qCount);
+						UpdateChecklistOkEnabled(hDlg);
 						return TRUE;
 					}
 
@@ -570,42 +1499,81 @@ namespace
 		dt.windowClass = 0;
 		dt.title[0] = L'\0';
 
+		ChecklistDialogRuntime runtime;
+		runtime.params = &const_cast<ChecklistDialogParams&>(params);
+
 		INT_PTR r = DialogBoxIndirectParamW(
 			GetModuleHandleW(nullptr),
 			reinterpret_cast<LPCDLGTEMPLATEW>(&dt),
 			parent,
 			ChecklistDlgProc,
-			reinterpret_cast<LPARAM>(&const_cast<ChecklistDialogParams&>(params)));
+			reinterpret_cast<LPARAM>(&runtime));
 
 		return r == 1;
 	}
 
 	static int GetOrderQuantity(SCStudyInterfaceRef sc)
 	{
-		if (sc.Input[INPUT_USE_TRADE_WINDOW_QTY].GetYesNo())
-			return (int)sc.TradeWindowOrderQuantity;
-		const int q = sc.Input[INPUT_FIXED_QTY].GetInt();
-		return q > 0 ? q : 1;
+		const int tradeWindowQty = (int)sc.TradeWindowOrderQuantity;
+		if (sc.Input[INPUT_USE_TRADE_WINDOW_QTY].GetYesNo() && tradeWindowQty > 0)
+			return tradeWindowQty;
+
+		const int fixedQty = sc.Input[INPUT_FIXED_QTY].GetInt();
+		return fixedQty > 0 ? fixedQty : 1;
 	}
 
 	static double GetClickedPrice(SCStudyInterfaceRef sc, HWND hwnd)
 	{
+		const bool debug = sc.Input[INPUT_DEBUG_LOG].GetYesNo();
+
 		// Prefer deriving from the current cursor pixel location.
-		double price = 0.0;
+		double pixelPrice = 0.0;
+		bool pixelOk = false;
 		if (hwnd != nullptr)
 		{
 			POINT pt{};
 			if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt))
 			{
-				price = sc.YPixelCoordinateToGraphValue(pt.y);
+				pixelPrice = sc.YPixelCoordinateToGraphValue(pt.y);
+				pixelOk = true;
 			}
 		}
 
+		double price = pixelPrice;
+		double activeVal = sc.ActiveToolYValue;
+		double closeVal = (sc.ArraySize > 0) ? sc.Close[sc.ArraySize - 1] : 0.0;
+
 		// Fallback: many ACSIL builds provide this as the pointer's chart value.
 		if (price == 0.0)
-			price = sc.ActiveToolYValue;
-		if (price == 0.0 && sc.ArraySize > 0)
-			price = sc.Close[sc.ArraySize - 1];
+			price = activeVal;
+		if (price == 0.0)
+			price = closeVal;
+
+		if (debug)
+		{
+			SCString msg;
+			msg.Format(
+				"Trade Gate debug: GetClickedPrice pixelOk=%d pixel=%.8f active=%.8f close=%.8f final=%.8f",\
+				pixelOk ? 1 : 0,
+				pixelPrice,
+				activeVal,
+				closeVal,
+				price);
+			sc.AddMessageToLog(msg, 0);
+		}
+
+		return price;
+	}
+
+	static double SanitizePrice(SCStudyInterfaceRef sc, double price)
+	{
+		// Protect against invalid coordinates returning extremely large sentinels.
+		if (!std::isfinite(price) || std::fabs(price) > 1e9)
+		{
+			if (sc.ArraySize > 0)
+				return sc.Close[sc.ArraySize - 1];
+			return 0.0;
+		}
 		return price;
 	}
 }
@@ -615,16 +1583,21 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "Trade Gate (SHIFT + Left Click)";
-		sc.StudyDescription = "SHIFT+LeftClick opens an order menu, runs a checklist gate, and submits the selected order programmatically.";
+		sc.StudyDescription = "SHIFT+LeftClick opens an order menu, runs a checklist gate (legacy inputs or JSON config), and submits the selected order programmatically.";
+		sc.GraphRegion = 1;
 		sc.AutoLoop = 0;
 		sc.ReceivePointerEvents = ACS_RECEIVE_POINTER_EVENTS_ALWAYS;
 		sc.UpdateAlways = 1;
 		sc.SupportAttachedOrdersForTrading = true;
 		sc.AllowEntryWithWorkingOrders = true;
 		sc.AllowOppositeEntryWithOpposingPositionOrOrders = true;
+		sc.AllowOnlyOneTradePerBar = false;
 
 		sc.Input[INPUT_ENABLE].Name = "Enable";
 		sc.Input[INPUT_ENABLE].SetYesNo(true);
+
+		sc.Input[INPUT_CONFIG_JSON_PATH].Name = "Checklist JSON config file (optional; relative to DLL folder)";
+		sc.Input[INPUT_CONFIG_JSON_PATH].SetString("");
 
 		sc.Input[INPUT_USE_TRADE_WINDOW_QTY].Name = "Use Trade Window Quantity";
 		sc.Input[INPUT_USE_TRADE_WINDOW_QTY].SetYesNo(true);
@@ -654,8 +1627,15 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		sc.Input[INPUT_FINAL_CONFIRM].Name = "Final confirm dialog";
 		sc.Input[INPUT_FINAL_CONFIRM].SetYesNo(true);
 
+		sc.Input[INPUT_DEBUG_LOG].Name = "Debug: log GetClickedPrice paths";
+		sc.Input[INPUT_DEBUG_LOG].SetYesNo(false);
+
 		return;
 	}
+
+	// Do not run trading logic during full chart recalculation; submissions would be skipped.
+	if (sc.IsFullRecalculation)
+		return;
 
 	if (!sc.Input[INPUT_ENABLE].GetYesNo())		return;
 
@@ -696,9 +1676,10 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		}
 
 		s_SCNewOrder order{};
+		order.Price1 = 0.0; // avoid sentinel values if the backend inspects Price1 on market orders
 		order.OrderQuantity = GetOrderQuantity(sc);
 
-		const double clickedPrice = GetClickedPrice(sc, hwnd);
+		const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
 
 		bool isBuy = false;
 		switch (cmd)
@@ -739,8 +1720,26 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		double result = isBuy ? sc.BuyEntry(order) : sc.SellEntry(order);
 		if (result <= 0.0)
 		{
+			const int resultCode = (int)result;
+			const char* resultText = sc.GetTradingErrorTextMessage(resultCode);
+			if (resultText == nullptr)
+				resultText = "";
+
 			SCString msg;
-			msg.Format("Trade Gate: Order rejected (Result=%.0f, Type=%d, Price1=%.8f)", result, (int)order.OrderType, order.Price1);
+			msg.Format(
+				"Trade Gate: Order rejected (Result=%d '%s', Type=%d, Qty=%d, Price1=%.8f, Replay=%d, ReplayStatus=%d, Sim=%d, SendOrders=%d, AutoTrading=%d, AutoTradingChart=%d, TradingLocked=%u)",
+				resultCode,
+				resultText,
+				(int)order.OrderType,
+				(int)order.OrderQuantity,
+				order.Price1,
+				sc.IsReplayRunning(),
+				sc.ReplayStatus,
+				sc.GlobalTradeSimulationIsOn,
+				sc.SendOrdersToTradeService,
+				sc.IsAutoTradingEnabled,
+				sc.IsAutoTradingOptionEnabledForChart,
+				(unsigned)sc.TradingIsLocked);
 			sc.AddMessageToLog(msg, 1);
 		}
 		else
