@@ -156,6 +156,7 @@ namespace
 	{
 		const wchar_t* title = L"Trade Gate Checklist";
 		bool finalConfirm = false;
+		std::wstring headerText;
 
 		struct Item
 		{
@@ -850,7 +851,7 @@ namespace
 		return r == IDYES;
 	}
 
-	static bool RunChecklist(SCStudyInterfaceRef sc, HWND hwnd)
+	static bool RunChecklist(SCStudyInterfaceRef sc, HWND hwnd, const std::wstring& headerText)
 	{
 		if (!sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo())
 			return true;
@@ -860,6 +861,7 @@ namespace
 		{
 			ChecklistDialogParams params;
 			params.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
+			params.headerText = headerText;
 			std::wstring jsonPath = ResolveConfigPathRelativeToModule(ToWideBestEffort(jsonPathIn));
 			std::string fileText;
 			if (!ReadFileUtf8(jsonPath, fileText))
@@ -895,6 +897,7 @@ namespace
 
 		ChecklistDialogParams params;
 		params.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
+		params.headerText = headerText;
 
 		auto addLegacyCheckbox = [&](const wchar_t* id, const SCString& q)
 		{
@@ -920,7 +923,17 @@ namespace
 		{
 			if (!params.finalConfirm)
 				return true;
-			return AskYesNoDetailed(hwnd, L"Trade Gate", L"Submit this order now?", L"", L"Submit", L"Cancel", IDNO);
+
+			const wchar_t* prompt = L"Submit this order now?";
+			std::wstring mainInstruction = headerText;
+			if (mainInstruction.empty())
+				mainInstruction = prompt;
+			else
+			{
+				mainInstruction += L"\r\n";
+				mainInstruction += prompt;
+			}
+			return AskYesNoDetailed(hwnd, L"Trade Gate", mainInstruction.c_str(), L"", L"Submit", L"Cancel", IDNO);
 		}
 
 		return RunChecklistCheckboxDialog(hwnd, params);
@@ -936,6 +949,7 @@ namespace
 		struct ChecklistDialogRuntime
 		{
 			ChecklistDialogParams* params = nullptr;
+			std::wstring mainText;
 			struct ControlRef
 			{
 				ChecklistDialogParams::Item::Type type;
@@ -1110,9 +1124,25 @@ namespace
 					HDC hdc = GetDC(hDlg);
 					const int textW = clientW - margin * 2;
 
-					const wchar_t* mainText = (params != nullptr && params->finalConfirm)
+					std::wstring mainTextCombined;
+					const wchar_t* baseMainText = (params != nullptr && params->finalConfirm)
 						? L"Check each item, then submit the order."
 						: L"Check each item to proceed.";
+					if (params != nullptr && !params->headerText.empty())
+					{
+						mainTextCombined = params->headerText;
+						mainTextCombined += L"\r\n";
+						mainTextCombined += baseMainText;
+					}
+					else
+					{
+						mainTextCombined = baseMainText;
+					}
+
+					if (runtime != nullptr)
+						runtime->mainText = mainTextCombined;
+
+					const wchar_t* mainText = (runtime != nullptr) ? runtime->mainText.c_str() : mainTextCombined.c_str();
 					int mainH = MeasureWrappedTextHeight(hdc, dlgFont, mainText, textW);
 					if (mainH < 18) mainH = 18;
 
@@ -1668,13 +1698,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			return;
 		}
 
-		if (!RunChecklist(sc, hwnd))
-		{
-			sc.AddMessageToLog("Trade Gate: Checklist failed/cancelled; order not submitted.", 1);
-			InProgress = 0;
-			return;
-		}
-
 		s_SCNewOrder order{};
 		order.Price1 = 0.0; // avoid sentinel values if the backend inspects Price1 on market orders
 		order.OrderQuantity = GetOrderQuantity(sc);
@@ -1682,39 +1705,60 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
 
 		bool isBuy = false;
+		std::wstring orderSummary;
+		auto formatPrice = [&](double price) -> std::wstring
+		{
+			SCString s;
+			s.Format("%.8f", price);
+			return ToWideBestEffort(s);
+		};
+
 		switch (cmd)
 		{
 			case CMD_BUY_MARKET:
 				isBuy = true;
 				order.OrderType = SCT_ORDERTYPE_MARKET;
+				orderSummary = L"Order: Buy Market";
 				break;
 			case CMD_BUY_LIMIT:
 				isBuy = true;
 				order.OrderType = SCT_ORDERTYPE_LIMIT;
 				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Down);
+				orderSummary = L"Order: Buy Limit @ " + formatPrice(order.Price1);
 				break;
 			case CMD_BUY_STOP:
 				isBuy = true;
 				order.OrderType = SCT_ORDERTYPE_STOP;
 				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Up);
+				orderSummary = L"Order: Buy Stop @ " + formatPrice(order.Price1);
 				break;
 			case CMD_SELL_MARKET:
 				isBuy = false;
 				order.OrderType = SCT_ORDERTYPE_MARKET;
+				orderSummary = L"Order: Sell Market";
 				break;
 			case CMD_SELL_LIMIT:
 				isBuy = false;
 				order.OrderType = SCT_ORDERTYPE_LIMIT;
 				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Up);
+				orderSummary = L"Order: Sell Limit @ " + formatPrice(order.Price1);
 				break;
 			case CMD_SELL_STOP:
 				isBuy = false;
 				order.OrderType = SCT_ORDERTYPE_STOP;
 				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Down);
+				orderSummary = L"Order: Sell Stop @ " + formatPrice(order.Price1);
 				break;
 			default:
 				InProgress = 0;
 				return;
+		}
+
+		if (!RunChecklist(sc, hwnd, orderSummary))
+		{
+			sc.AddMessageToLog("Trade Gate: Checklist failed/cancelled; order not submitted.", 1);
+			InProgress = 0;
+			return;
 		}
 
 		double result = isBuy ? sc.BuyEntry(order) : sc.SellEntry(order);
