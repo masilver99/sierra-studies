@@ -778,6 +778,8 @@ namespace
 					const int buttonHeight = 28;
 					const int buttonGap = 10;
 					const int minClientWidth = 520;
+					const int optionIndent = 18;
+					const int optionBulletWidth = 26;
 
 					RECT rcClient{};
 					GetClientRect(hDlg, &rcClient);
@@ -855,7 +857,7 @@ namespace
 									contentH += labelH + 6;
 									for (const auto& opt : item.options)
 									{
-										int oh = MeasureWrappedTextHeight(hdc, dlgFont, opt.c_str(), textW - 26);
+										int oh = MeasureWrappedTextHeight(hdc, dlgFont, opt.c_str(), textW - optionIndent - optionBulletWidth);
 										oh += 8;
 										if (oh < 22) oh = 22;
 										contentH += oh + 4;
@@ -1037,7 +1039,7 @@ namespace
 									for (int i = 0; i < optCount; ++i)
 									{
 										const auto& opt = item.options[i];
-										int oh = MeasureWrappedTextHeight(hdc, dlgFont, opt.c_str(), width - 26);
+										int oh = MeasureWrappedTextHeight(hdc, dlgFont, opt.c_str(), width - optionIndent - optionBulletWidth);
 										oh += 8;
 										if (oh < 22) oh = 22;
 										DWORD st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_MULTILINE;
@@ -1053,9 +1055,9 @@ namespace
 											L"BUTTON",
 											opt.c_str(),
 											st,
-											margin,
+											margin + optionIndent,
 											y,
-											width,
+											width - optionIndent,
 											oh,
 											hDlg,
 											(HMENU)(uintptr_t)id,
