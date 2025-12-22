@@ -77,6 +77,24 @@ namespace
 		INPUT_DEBUG_LOG = 11,
 	};
 
+	struct ChecklistDialogParams;
+
+	// Helper forward declarations are placed near their first use below.
+
+	struct TradeGateSession
+	{
+		HWND checklistHwnd = nullptr;
+		bool checklistDone = false;
+		bool checklistResult = false;
+		s_SCNewOrder pendingOrder{};
+		bool pendingIsBuy = false;
+		std::wstring orderSummary;
+	};
+
+	static TradeGateSession gSession;
+	constexpr int STATE_IDLE = 0;
+	constexpr int STATE_WAITING_DIALOG = 1;
+
 	enum MenuCommand : UINT
 	{
 		CMD_NONE = 0,
@@ -183,7 +201,7 @@ namespace
 		std::vector<Item> items;
 	};
 
-	static bool RunChecklistCheckboxDialog(HWND parent, const ChecklistDialogParams& params);
+	static HWND StartChecklistCheckboxDialog(HWND parent, ChecklistDialogParams& params, TradeGateSession& session);
 
 	static bool AskYesNo(HWND hwnd, const wchar_t* title, const wchar_t* text)
 	{
@@ -239,6 +257,21 @@ namespace
 		MultiByteToWideChar(codePage, flags, s.c_str(), -1, out.data(), needed);
 		return out;
 	}
+
+	static std::string ToUtf8(const std::wstring& w)
+	{
+		if (w.empty())
+			return {};
+		int needed = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		if (needed <= 0)
+			return {};
+		std::string out;
+		out.resize((size_t)needed - 1);
+		WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, out.data(), needed, nullptr, nullptr);
+		return out;
+	}
+
+	// BuildChecklistParams moved below once helper implementations are available.
 
 	static std::wstring GetThisModuleDirectory()
 	{
@@ -791,6 +824,68 @@ namespace
 		return true;
 	}
 
+	static bool BuildChecklistParams(
+		SCStudyInterfaceRef sc,
+		const std::wstring& headerText,
+		ChecklistDialogParams& outParams,
+		std::wstring& outError)
+	{
+		outError.clear();
+		outParams.items.clear();
+		outParams.headerText = headerText;
+		outParams.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
+
+		if (!sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo())
+			return true;
+
+		const SCString jsonPathIn = sc.Input[INPUT_CONFIG_JSON_PATH].GetString();
+		if (!jsonPathIn.IsEmpty())
+		{
+			std::wstring jsonPath = ResolveConfigPathRelativeToModule(ToWideBestEffort(jsonPathIn));
+			std::string fileText;
+			if (!ReadFileUtf8(jsonPath, fileText))
+			{
+				outError = L"Could not read checklist JSON file: ";
+				outError += jsonPath;
+				return false;
+			}
+
+			if (!ParseChecklistJson(fileText, outParams, outError))
+			{
+				if (outError.empty())
+					outError = L"Checklist JSON parse/validation failed.";
+				return false;
+			}
+			return true;
+		}
+
+		const SCString q1 = sc.Input[INPUT_CHECK_1_TEXT].GetString();
+		const SCString q2 = sc.Input[INPUT_CHECK_2_TEXT].GetString();
+		const SCString q3 = sc.Input[INPUT_CHECK_3_TEXT].GetString();
+		const SCString q4 = sc.Input[INPUT_CHECK_4_TEXT].GetString();
+
+		auto addLegacyCheckbox = [&](const wchar_t* id, const SCString& q)
+		{
+			if (q.IsEmpty())
+				return;
+			std::wstring w = ToWideBestEffort(q);
+			if (w.empty())
+				return;
+			ChecklistDialogParams::Item item;
+			item.id = id;
+			item.type = ChecklistDialogParams::Item::Type::Checkbox;
+			item.label = std::move(w);
+			item.required = true;
+			outParams.items.push_back(std::move(item));
+		};
+
+		addLegacyCheckbox(L"q1", q1);
+		addLegacyCheckbox(L"q2", q2);
+		addLegacyCheckbox(L"q3", q3);
+		addLegacyCheckbox(L"q4", q4);
+		return true;
+	}
+
 	static bool AskYesNoDetailed(
 		HWND hwnd,
 		const wchar_t* title,
@@ -851,93 +946,8 @@ namespace
 		return r == IDYES;
 	}
 
-	static bool RunChecklist(SCStudyInterfaceRef sc, HWND hwnd, const std::wstring& headerText)
-	{
-		if (!sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo())
-			return true;
-
-		const SCString jsonPathIn = sc.Input[INPUT_CONFIG_JSON_PATH].GetString();
-		if (!jsonPathIn.IsEmpty())
-		{
-			ChecklistDialogParams params;
-			params.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
-			params.headerText = headerText;
-			std::wstring jsonPath = ResolveConfigPathRelativeToModule(ToWideBestEffort(jsonPathIn));
-			std::string fileText;
-			if (!ReadFileUtf8(jsonPath, fileText))
-			{
-				SCString msg;
-				msg.Format("Trade Gate: Could not read checklist JSON file: %s", jsonPathIn.GetChars());
-				sc.AddMessageToLog(msg, 1);
-				MessageBoxW(hwnd, (L"Could not read checklist JSON file:\r\n" + jsonPath).c_str(), L"Trade Gate", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-				return false;
-			}
-
-			std::wstring parseError;
-			if (!ParseChecklistJson(fileText, params, parseError))
-			{
-				std::wstring msg = L"Checklist JSON parse/validation failed.";
-				if (!parseError.empty())
-				{
-					msg += L"\r\n\r\n";
-					msg += parseError;
-				}
-				MessageBoxW(hwnd, msg.c_str(), L"Trade Gate", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-				sc.AddMessageToLog("Trade Gate: Checklist JSON parse/validation failed.", 1);
-				return false;
-			}
-
-			return RunChecklistCheckboxDialog(hwnd, params);
-		}
-
-		const SCString q1 = sc.Input[INPUT_CHECK_1_TEXT].GetString();
-		const SCString q2 = sc.Input[INPUT_CHECK_2_TEXT].GetString();
-		const SCString q3 = sc.Input[INPUT_CHECK_3_TEXT].GetString();
-		const SCString q4 = sc.Input[INPUT_CHECK_4_TEXT].GetString();
-
-		ChecklistDialogParams params;
-		params.finalConfirm = sc.Input[INPUT_FINAL_CONFIRM].GetYesNo();
-		params.headerText = headerText;
-
-		auto addLegacyCheckbox = [&](const wchar_t* id, const SCString& q)
-		{
-			if (q.IsEmpty())
-				return;
-			std::wstring w = ToWideBestEffort(q);
-			if (w.empty())
-				return;
-			ChecklistDialogParams::Item item;
-			item.id = id;
-			item.type = ChecklistDialogParams::Item::Type::Checkbox;
-			item.label = std::move(w);
-			item.required = true;
-			params.items.push_back(std::move(item));
-		};
-
-		addLegacyCheckbox(L"q1", q1);
-		addLegacyCheckbox(L"q2", q2);
-		addLegacyCheckbox(L"q3", q3);
-		addLegacyCheckbox(L"q4", q4);
-
-		if (params.items.empty())
-		{
-			if (!params.finalConfirm)
-				return true;
-
-			const wchar_t* prompt = L"Submit this order now?";
-			std::wstring mainInstruction = headerText;
-			if (mainInstruction.empty())
-				mainInstruction = prompt;
-			else
-			{
-				mainInstruction += L"\r\n";
-				mainInstruction += prompt;
-			}
-			return AskYesNoDetailed(hwnd, L"Trade Gate", mainInstruction.c_str(), L"", L"Submit", L"Cancel", IDNO);
-		}
-
-		return RunChecklistCheckboxDialog(hwnd, params);
-	}
+	// Legacy RunChecklist removed; the modeless flow now builds params in BuildChecklistParams
+	// and launches StartChecklistCheckboxDialog via the main state machine.
 
 	namespace
 	{
@@ -949,6 +959,7 @@ namespace
 		struct ChecklistDialogRuntime
 		{
 			ChecklistDialogParams* params = nullptr;
+			TradeGateSession* session = nullptr;
 			std::wstring mainText;
 			struct ControlRef
 			{
@@ -1099,6 +1110,8 @@ namespace
 				case WM_INITDIALOG:
 				{
 					runtime = reinterpret_cast<ChecklistDialogRuntime*>(lParam);
+					if (runtime == nullptr)
+						return FALSE;
 					SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)runtime);
 					params = runtime != nullptr ? runtime->params : nullptr;
 					if (params != nullptr && params->title != nullptr)
@@ -1469,6 +1482,7 @@ namespace
 						SendMessageW(hCancel, WM_SETFONT, (WPARAM)dlgFont, TRUE);
 
 					UpdateChecklistOkEnabled(hDlg);
+					SetWindowPos(hDlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 					return TRUE;
 				}
 
@@ -1476,9 +1490,16 @@ namespace
 				{
 					const UINT id = LOWORD(wParam);
 					const UINT code = HIWORD(wParam);
+					TradeGateSession* session = runtime != nullptr ? runtime->session : nullptr;
 					if (id == IDC_CHECKLIST_CANCEL)
 					{
-						EndDialog(hDlg, 0);
+						if (session != nullptr)
+						{
+							session->checklistResult = false;
+							session->checklistDone = true;
+							session->checklistHwnd = nullptr;
+						}
+						DestroyWindow(hDlg);
 						return TRUE;
 					}
 					if (id == IDC_CHECKLIST_OK)
@@ -1487,7 +1508,13 @@ namespace
 						HWND hOk = GetDlgItem(hDlg, IDC_CHECKLIST_OK);
 						if (hOk != nullptr && IsWindowEnabled(hOk))
 						{
-							EndDialog(hDlg, 1);
+							if (session != nullptr)
+							{
+								session->checklistResult = true;
+								session->checklistDone = true;
+								session->checklistHwnd = nullptr;
+							}
+							DestroyWindow(hDlg);
 							return TRUE;
 						}
 						return TRUE;
@@ -1500,15 +1527,39 @@ namespace
 
 					break;
 				}
+				case WM_CLOSE:
+				{
+					TradeGateSession* session = runtime != nullptr ? runtime->session : nullptr;
+					if (session != nullptr)
+					{
+						session->checklistResult = false;
+						session->checklistDone = true;
+						session->checklistHwnd = nullptr;
+					}
+					DestroyWindow(hDlg);
+					return TRUE;
+				}
+				case WM_NCDESTROY:
+				{
+					TradeGateSession* session = runtime != nullptr ? runtime->session : nullptr;
+					if (session != nullptr && session->checklistHwnd == hDlg)
+						session->checklistHwnd = nullptr;
+					if (runtime != nullptr)
+					{
+						delete runtime;
+						SetWindowLongPtrW(hDlg, GWLP_USERDATA, 0);
+					}
+					return FALSE;
+				}
 			}
 			return FALSE;
 		}
 	}
 
-	static bool RunChecklistCheckboxDialog(HWND parent, const ChecklistDialogParams& params)
+	static HWND StartChecklistCheckboxDialog(HWND parent, ChecklistDialogParams& params, TradeGateSession& session)
 	{
 		// Build a minimal dialog template with no controls; we add all controls in WM_INITDIALOG.
-		// Using DialogBoxIndirectParam keeps it modal and provides default keyboard navigation.
+		// The modeless dialog keeps Sierra Chart's UI thread free so price updates continue.
 		struct DialogTemplate
 		{
 			DLGTEMPLATE dlg;
@@ -1529,17 +1580,25 @@ namespace
 		dt.windowClass = 0;
 		dt.title[0] = L'\0';
 
-		ChecklistDialogRuntime runtime;
-		runtime.params = &const_cast<ChecklistDialogParams&>(params);
+		ChecklistDialogRuntime* runtime = new ChecklistDialogRuntime();
+		runtime->params = &params;
+		runtime->session = &session;
 
-		INT_PTR r = DialogBoxIndirectParamW(
+		HWND hDlg = CreateDialogIndirectParamW(
 			GetModuleHandleW(nullptr),
 			reinterpret_cast<LPCDLGTEMPLATEW>(&dt),
 			parent,
 			ChecklistDlgProc,
-			reinterpret_cast<LPARAM>(&runtime));
+			reinterpret_cast<LPARAM>(runtime));
 
-		return r == 1;
+		if (hDlg == nullptr)
+		{
+			delete runtime;
+			return nullptr;
+		}
+
+		ShowWindow(hDlg, SW_SHOWNORMAL);
+		return hDlg;
 	}
 
 	static int GetOrderQuantity(SCStudyInterfaceRef sc)
@@ -1667,133 +1726,214 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 	if (sc.IsFullRecalculation)
 		return;
 
-	if (!sc.Input[INPUT_ENABLE].GetYesNo())		return;
+	if (!sc.Input[INPUT_ENABLE].GetYesNo())	return;
 
-	// Prevent re-entrant menu/dialog loops.
-	int& InProgress = sc.GetPersistentInt(1);
-	if (InProgress)		return;
+	int& state = sc.GetPersistentInt(1);
+	int& PrevLButtonDown = sc.GetPersistentInt(2);
+
+	if (state == STATE_WAITING_DIALOG)
+	{
+		if (gSession.checklistDone)
+		{
+			if (gSession.checklistResult)
+			{
+				double result = gSession.pendingIsBuy ? sc.BuyEntry(gSession.pendingOrder) : sc.SellEntry(gSession.pendingOrder);
+				if (result <= 0.0)
+				{
+					const int resultCode = (int)result;
+					const char* resultText = sc.GetTradingErrorTextMessage(resultCode);
+					if (resultText == nullptr)
+						resultText = "";
+
+					SCString msg;
+					msg.Format(
+						"Trade Gate: Order rejected (Result=%d '%s', Type=%d, Qty=%d, Price1=%.8f, Replay=%d, ReplayStatus=%d, Sim=%d, SendOrders=%d, AutoTrading=%d, AutoTradingChart=%d, TradingLocked=%u)",
+						resultCode,
+						resultText,
+						(int)gSession.pendingOrder.OrderType,
+						(int)gSession.pendingOrder.OrderQuantity,
+						gSession.pendingOrder.Price1,
+						sc.IsReplayRunning(),
+						sc.ReplayStatus,
+						sc.GlobalTradeSimulationIsOn,
+						sc.SendOrdersToTradeService,
+						sc.IsAutoTradingEnabled,
+						sc.IsAutoTradingOptionEnabledForChart,
+						(unsigned)sc.TradingIsLocked);
+					sc.AddMessageToLog(msg, 1);
+				}
+				else
+				{
+					sc.AddMessageToLog("Trade Gate: Order submitted.", 0);
+				}
+			}
+			else
+			{
+				sc.AddMessageToLog("Trade Gate: Checklist failed/cancelled; order not submitted.", 1);
+			}
+
+			gSession.checklistDone = false;
+			gSession.checklistResult = false;
+			gSession.pendingOrder = s_SCNewOrder{};
+			gSession.pendingIsBuy = false;
+			state = STATE_IDLE;
+			return;
+		}
+
+		if (gSession.checklistHwnd != nullptr && !IsWindow(gSession.checklistHwnd))
+		{
+			gSession.checklistHwnd = nullptr;
+			gSession.checklistDone = false;
+			gSession.checklistResult = false;
+			state = STATE_IDLE;
+		}
+		return;
+	}
 
 	// Reliable click detection: poll for a left-button down edge while SHIFT is held,
 	// and only when the cursor is actually over this chart window.
-	int& PrevLButtonDown = sc.GetPersistentInt(2);
 	const bool lDown = (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
 	const bool justPressed = lDown && (PrevLButtonDown == 0);
 	PrevLButtonDown = lDown ? 1 : 0;
 
-	if (justPressed)
-	{
-		if (sc.Input[INPUT_REQUIRE_SHIFT].GetYesNo() && !GetShiftDown())
-			return;
-
-		HWND hwnd = GetChartHwnd(sc);
-		if (!IsCursorOverWindow(hwnd))
-			return;
-
-		InProgress = 1;
-
-		// Capture the chart price exactly at the click point before the menu opens
-		// so mouse movement while choosing a menu item does not shift the price.
-		const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
-
-		UINT cmd = ShowOrderMenu(hwnd);
-		if (cmd == CMD_NONE || cmd == CMD_CANCEL)
-		{
-			InProgress = 0;
-			return;
-		}
-
-		s_SCNewOrder order{};
-		order.Price1 = 0.0; // avoid sentinel values if the backend inspects Price1 on market orders
-		order.OrderQuantity = GetOrderQuantity(sc);
-
-		bool isBuy = false;
-		std::wstring orderSummary;
-		auto formatPrice = [&](double price) -> std::wstring
-		{
-			SCString s;
-			s.Format("%.8f", price);
-			return ToWideBestEffort(s);
-		};
-
-		switch (cmd)
-		{
-			case CMD_BUY_MARKET:
-				isBuy = true;
-				order.OrderType = SCT_ORDERTYPE_MARKET;
-				orderSummary = L"Order: Buy Market";
-				break;
-			case CMD_BUY_LIMIT:
-				isBuy = true;
-				order.OrderType = SCT_ORDERTYPE_LIMIT;
-				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Nearest);
-				orderSummary = L"Order: Buy Limit @ " + formatPrice(order.Price1);
-				break;
-			case CMD_BUY_STOP:
-				isBuy = true;
-				order.OrderType = SCT_ORDERTYPE_STOP;
-				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Up);
-				orderSummary = L"Order: Buy Stop @ " + formatPrice(order.Price1);
-				break;
-			case CMD_SELL_MARKET:
-				isBuy = false;
-				order.OrderType = SCT_ORDERTYPE_MARKET;
-				orderSummary = L"Order: Sell Market";
-				break;
-			case CMD_SELL_LIMIT:
-				isBuy = false;
-				order.OrderType = SCT_ORDERTYPE_LIMIT;
-				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Up);
-				orderSummary = L"Order: Sell Limit @ " + formatPrice(order.Price1);
-				break;
-			case CMD_SELL_STOP:
-				isBuy = false;
-				order.OrderType = SCT_ORDERTYPE_STOP;
-				order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Down);
-				orderSummary = L"Order: Sell Stop @ " + formatPrice(order.Price1);
-				break;
-			default:
-				InProgress = 0;
-				return;
-		}
-
-		if (!RunChecklist(sc, hwnd, orderSummary))
-		{
-			sc.AddMessageToLog("Trade Gate: Checklist failed/cancelled; order not submitted.", 1);
-			InProgress = 0;
-			return;
-		}
-
-		double result = isBuy ? sc.BuyEntry(order) : sc.SellEntry(order);
-		if (result <= 0.0)
-		{
-			const int resultCode = (int)result;
-			const char* resultText = sc.GetTradingErrorTextMessage(resultCode);
-			if (resultText == nullptr)
-				resultText = "";
-
-			SCString msg;
-			msg.Format(
-				"Trade Gate: Order rejected (Result=%d '%s', Type=%d, Qty=%d, Price1=%.8f, Replay=%d, ReplayStatus=%d, Sim=%d, SendOrders=%d, AutoTrading=%d, AutoTradingChart=%d, TradingLocked=%u)",
-				resultCode,
-				resultText,
-				(int)order.OrderType,
-				(int)order.OrderQuantity,
-				order.Price1,
-				sc.IsReplayRunning(),
-				sc.ReplayStatus,
-				sc.GlobalTradeSimulationIsOn,
-				sc.SendOrdersToTradeService,
-				sc.IsAutoTradingEnabled,
-				sc.IsAutoTradingOptionEnabledForChart,
-				(unsigned)sc.TradingIsLocked);
-			sc.AddMessageToLog(msg, 1);
-		}
-		else
-		{
-			sc.AddMessageToLog("Trade Gate: Order submitted.", 0);
-		}
-
-		InProgress = 0;
+	if (!justPressed)
 		return;
+
+	if (sc.Input[INPUT_REQUIRE_SHIFT].GetYesNo() && !GetShiftDown())
+		return;
+
+	HWND hwnd = GetChartHwnd(sc);
+	if (!IsCursorOverWindow(hwnd))
+		return;
+
+	// Capture the chart price exactly at the click point before the menu opens
+	// so mouse movement while choosing a menu item does not shift the price.
+	const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
+
+	UINT cmd = ShowOrderMenu(hwnd);
+	if (cmd == CMD_NONE || cmd == CMD_CANCEL)
+		return;
+
+	s_SCNewOrder order{};
+	order.Price1 = 0.0; // avoid sentinel values if the backend inspects Price1 on market orders
+	order.OrderQuantity = GetOrderQuantity(sc);
+
+	bool isBuy = false;
+	std::wstring orderSummary;
+	auto formatPrice = [&](double price) -> std::wstring
+	{
+		SCString s;
+		s.Format("%.8f", price);
+		return ToWideBestEffort(s);
+	};
+
+	switch (cmd)
+	{
+		case CMD_BUY_MARKET:
+			isBuy = true;
+			order.OrderType = SCT_ORDERTYPE_MARKET;
+			orderSummary = L"Order: Buy Market";
+			break;
+		case CMD_BUY_LIMIT:
+			isBuy = true;
+			order.OrderType = SCT_ORDERTYPE_LIMIT;
+			order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Nearest);
+			orderSummary = L"Order: Buy Limit @ " + formatPrice(order.Price1);
+			break;
+		case CMD_BUY_STOP:
+			isBuy = true;
+			order.OrderType = SCT_ORDERTYPE_STOP;
+			order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Up);
+			orderSummary = L"Order: Buy Stop @ " + formatPrice(order.Price1);
+			break;
+		case CMD_SELL_MARKET:
+			isBuy = false;
+			order.OrderType = SCT_ORDERTYPE_MARKET;
+			orderSummary = L"Order: Sell Market";
+			break;
+		case CMD_SELL_LIMIT:
+			isBuy = false;
+			order.OrderType = SCT_ORDERTYPE_LIMIT;
+			order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Up);
+			orderSummary = L"Order: Sell Limit @ " + formatPrice(order.Price1);
+			break;
+		case CMD_SELL_STOP:
+			isBuy = false;
+			order.OrderType = SCT_ORDERTYPE_STOP;
+			order.Price1 = RoundToTick(clickedPrice, sc.TickSize, TickRounding::Down);
+			orderSummary = L"Order: Sell Stop @ " + formatPrice(order.Price1);
+			break;
+		default:
+			return;
+	}
+
+	ChecklistDialogParams params;
+	std::wstring checklistError;
+	if (!BuildChecklistParams(sc, orderSummary, params, checklistError))
+	{
+		SCString msg = "Trade Gate: Checklist init failed.";
+		if (!checklistError.empty())
+		{
+			std::string utf8 = ToUtf8(checklistError);
+			if (!utf8.empty())
+			{
+				msg += " Detail: ";
+				msg += utf8.c_str();
+			}
+		}
+		sc.AddMessageToLog(msg, 1);
+		return;
+	}
+
+	const bool checklistEnabled = sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo();
+	const bool needDialog = checklistEnabled && (!params.items.empty() || params.finalConfirm);
+	if (needDialog)
+	{
+		gSession.checklistDone = false;
+		gSession.checklistResult = false;
+		gSession.pendingOrder = order;
+		gSession.pendingIsBuy = isBuy;
+		gSession.orderSummary = orderSummary;
+		HWND dlg = StartChecklistCheckboxDialog(hwnd, params, gSession);
+		if (dlg == nullptr)
+		{
+			sc.AddMessageToLog("Trade Gate: Could not create checklist dialog.", 1);
+			gSession.checklistDone = false;
+			gSession.pendingIsBuy = false;
+			return;
+		}
+		gSession.checklistHwnd = dlg;
+		state = STATE_WAITING_DIALOG;
+		return;
+	}
+
+	double result = isBuy ? sc.BuyEntry(order) : sc.SellEntry(order);
+	if (result <= 0.0)
+	{
+		const int resultCode = (int)result;
+		const char* resultText = sc.GetTradingErrorTextMessage(resultCode);
+		if (resultText == nullptr)
+			resultText = "";
+
+		SCString msg;
+		msg.Format(
+			"Trade Gate: Order rejected (Result=%d '%s', Type=%d, Qty=%d, Price1=%.8f, Replay=%d, ReplayStatus=%d, Sim=%d, SendOrders=%d, AutoTrading=%d, AutoTradingChart=%d, TradingLocked=%u)",
+			resultCode,
+			resultText,
+			(int)order.OrderType,
+			(int)order.OrderQuantity,
+			order.Price1,
+			sc.IsReplayRunning(),
+			sc.ReplayStatus,
+			sc.GlobalTradeSimulationIsOn,
+			sc.SendOrdersToTradeService,
+			sc.IsAutoTradingEnabled,
+			sc.IsAutoTradingOptionEnabledForChart,
+			(unsigned)sc.TradingIsLocked);
+		sc.AddMessageToLog(msg, 1);
+	}
+	else
+	{
+		sc.AddMessageToLog("Trade Gate: Order submitted.", 0);
 	}
 }
