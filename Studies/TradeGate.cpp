@@ -97,10 +97,10 @@ namespace
 		bool orderDialogDone = false;
 		bool orderDialogResult = false;
 		UINT orderDialogCmd = 0;
+		double orderDialogSelectedPrice = 0.0;
+		bool orderDialogHasPrice = false;
 		double clickedPrice = 0.0;
 		int orderQuantity = 0;
-		double previewPrice = 0.0;
-		bool hasPreviewPrice = false;
 		POINT lastClickScreenPt{};
 		bool hasClickPoint = false;
 		DWORD lastPopupTick = 0;
@@ -177,55 +177,16 @@ namespace
 		return cmd;
 	}
 
-	static void ClearPreviewLine(SCStudyInterfaceRef sc)
-	{
-		int& lineId = sc.GetPersistentInt(3);
-		if (lineId != 0)
-		{
-			sc.DeleteACSChartDrawing(sc.ChartNumber, lineId, 0);
-			lineId = 0;
-		}
-	}
-
-	static void UpdatePreviewLine(SCStudyInterfaceRef sc, double price)
-	{
-		int& lineId = sc.GetPersistentInt(3);
-		if (!std::isfinite(price) || price <= 0.0)
-		{
-			ClearPreviewLine(sc);
-			return;
-		}
-
-		s_UseTool tool;
-		tool.Clear();
-		tool.ChartNumber = sc.ChartNumber;
-		tool.DrawingType = DRAWING_LINE;
-		tool.AddMethod = UTAM_ADD_OR_ADJUST;
-		tool.LineNumber = (lineId == 0) ? -1 : lineId;
-		tool.BeginIndex = 0;
-		const int forward = 200;
-		const int endIndex = (sc.ArraySize > 0 ? sc.ArraySize - 1 : 0) + forward;
-		tool.EndIndex = endIndex;
-		tool.BeginValue = (float)price;
-		tool.EndValue = (float)price;
-		tool.Color = RGB(255, 128, 0);
-		tool.LineWidth = 2;
-		tool.AddAsUserDrawnDrawing = 0;
-		sc.UseTool(tool);
-		if (lineId == 0)
-			lineId = tool.LineNumber;
-	}
-
 	static void ResetOrderDialogState(TradeGateSession& s)
 	{
 		s.orderDialogCmd = CMD_NONE;
 		s.orderDialogDone = false;
 		s.orderDialogResult = false;
 		s.orderDialogHwnd = nullptr;
+		s.orderDialogSelectedPrice = 0.0;
+		s.orderDialogHasPrice = false;
 		s.clickedPrice = 0.0;
 		s.orderQuantity = 0;
-		s.previewPrice = 0.0;
-		s.hasPreviewPrice = false;
 		s.lastClickScreenPt = POINT{};
 		s.hasClickPoint = false;
 	}
@@ -253,7 +214,7 @@ namespace
 	static std::wstring FormatPriceW(double price)
 	{
 		SCString s;
-		s.Format("%.8f", price);
+		s.Format("%.2f", price);
 		return ToWideBestEffort(s);
 	}
 
@@ -264,7 +225,7 @@ namespace
 			case CMD_BUY_LIMIT: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Nearest);
 			case CMD_BUY_STOP: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Up);
 			case CMD_SELL_LIMIT: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Up);
-			case CMD_SELL_STOP: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Down);
+			case CMD_SELL_STOP: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Nearest);
 			default: return rt.clickedPrice;
 		}
 	}
@@ -285,17 +246,24 @@ namespace
 	{
 		if (rt != nullptr)
 		{
-			TradeGateSession* session = rt->session;
-			if (session != nullptr)
-			{
-				session->orderDialogCmd = cmd;
-				session->orderDialogResult = (cmd != CMD_NONE);
-				session->orderDialogDone = true;
-				session->orderDialogHwnd = nullptr;
-				double preview = PriceForCommand(*rt, cmd);
-				session->previewPrice = preview;
-				session->hasPreviewPrice = std::isfinite(preview) && preview > 0.0;
-			}
+				TradeGateSession* session = rt->session;
+				if (session != nullptr)
+				{
+					if (cmd != CMD_NONE)
+					{
+						session->orderDialogSelectedPrice = PriceForCommand(*rt, cmd);
+						session->orderDialogHasPrice = true;
+					}
+					else
+					{
+						session->orderDialogSelectedPrice = 0.0;
+						session->orderDialogHasPrice = false;
+					}
+					session->orderDialogCmd = cmd;
+					session->orderDialogResult = (cmd != CMD_NONE);
+					session->orderDialogDone = true;
+					session->orderDialogHwnd = nullptr;
+				}
 		}
 		DestroyWindow(hDlg);
 	}
@@ -321,8 +289,9 @@ namespace
 				if (dlgFont == nullptr)
 					dlgFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
+				double headerPrice = RoundToTick(rt->clickedPrice, rt->tickSize, TickRounding::Nearest);
 				std::wstring header = L"Order price at click: ";
-				header += FormatPriceW(rt->clickedPrice);
+				header += FormatPriceW(headerPrice);
 				header += L"    Qty: ";
 				header += std::to_wstring(rt->quantity);
 
@@ -1865,7 +1834,6 @@ namespace
 				}
 			}
 			sc.AddMessageToLog(msg, 1);
-			ClearPreviewLine(sc);
 			ResetOrderDialogState(gSession);
 			return;
 		}
@@ -1886,7 +1854,6 @@ namespace
 				sc.AddMessageToLog("Trade Gate: Could not create checklist dialog.", 1);
 				gSession.checklistDone = false;
 				gSession.pendingIsBuy = false;
-				ClearPreviewLine(sc);
 				ResetOrderDialogState(gSession);
 				return;
 			}
@@ -1925,7 +1892,6 @@ namespace
 			sc.AddMessageToLog("Trade Gate: Order submitted.", 0);
 		}
 
-		ClearPreviewLine(sc);
 		ResetOrderDialogState(gSession);
 		state = STATE_IDLE;
 	}
@@ -1989,32 +1955,19 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 	// Do not run trading logic during full chart recalculation; submissions would be skipped.
 	if (sc.IsFullRecalculation)
 	{
-		ClearPreviewLine(sc);
 		return;
 	}
 
 	if (!sc.Input[INPUT_ENABLE].GetYesNo())	
 	{
-		ClearPreviewLine(sc);
 		return;
 	}
 
 	int& state = sc.GetPersistentInt(1);
 	int& PrevLButtonDown = sc.GetPersistentInt(2);
 
-	if (state == STATE_IDLE)
-	{
-		// Safety: ensure any stray preview line is cleared when idle.
-		ClearPreviewLine(sc);
-	}
-
 	if (state == STATE_WAITING_DIALOG)
 	{
-		if (gSession.hasPreviewPrice)
-			UpdatePreviewLine(sc, gSession.previewPrice);
-		else
-			ClearPreviewLine(sc);
-
 		if (gSession.checklistDone)
 		{
 			if (gSession.checklistResult)
@@ -2061,7 +2014,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			gSession.pendingOrder = s_SCNewOrder{};
 			gSession.pendingIsBuy = false;
 			gSession.checklistJson.clear();
-			ClearPreviewLine(sc);
 			ResetOrderDialogState(gSession);
 			state = STATE_IDLE;
 			return;
@@ -2073,7 +2025,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			gSession.checklistDone = false;
 			gSession.checklistResult = false;
 			gSession.checklistJson.clear();
-			ClearPreviewLine(sc);
 			ResetOrderDialogState(gSession);
 			state = STATE_IDLE;
 		}
@@ -2083,10 +2034,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 	if (state == STATE_WAITING_ORDER)
 	{
 		HWND hwnd = GetChartHwnd(sc);
-		if (gSession.hasPreviewPrice)
-			UpdatePreviewLine(sc, gSession.previewPrice);
-		else
-			ClearPreviewLine(sc);
 
 		if (gSession.orderDialogDone)
 		{
@@ -2100,9 +2047,13 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 				std::wstring orderSummary;
 				auto formatPrice = [&](double price) -> std::wstring
 				{
-					SCString s;
-					s.Format("%.8f", price);
-					return ToWideBestEffort(s);
+					return FormatPriceW(price);
+				};
+				auto lockedPrice = [&](TickRounding rounding) -> double
+				{
+					if (gSession.orderDialogHasPrice)
+						return gSession.orderDialogSelectedPrice;
+					return RoundToTick(gSession.clickedPrice, sc.TickSize, rounding);
 				};
 
 				switch (gSession.orderDialogCmd)
@@ -2115,13 +2066,13 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 					case CMD_BUY_LIMIT:
 						isBuy = true;
 						order.OrderType = SCT_ORDERTYPE_LIMIT;
-						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Nearest);
+						order.Price1 = lockedPrice(TickRounding::Nearest);
 						orderSummary = L"Order: Buy Limit @ " + formatPrice(order.Price1);
 						break;
 					case CMD_BUY_STOP:
 						isBuy = true;
 						order.OrderType = SCT_ORDERTYPE_STOP;
-						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Up);
+						order.Price1 = lockedPrice(TickRounding::Up);
 						orderSummary = L"Order: Buy Stop @ " + formatPrice(order.Price1);
 						break;
 					case CMD_SELL_MARKET:
@@ -2132,34 +2083,25 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 					case CMD_SELL_LIMIT:
 						isBuy = false;
 						order.OrderType = SCT_ORDERTYPE_LIMIT;
-						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Up);
+						order.Price1 = lockedPrice(TickRounding::Up);
 						orderSummary = L"Order: Sell Limit @ " + formatPrice(order.Price1);
 						break;
 					case CMD_SELL_STOP:
 						isBuy = false;
 						order.OrderType = SCT_ORDERTYPE_STOP;
-						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Down);
+						order.Price1 = lockedPrice(TickRounding::Nearest);
 						orderSummary = L"Order: Sell Stop @ " + formatPrice(order.Price1);
 						break;
 					default:
-						ClearPreviewLine(sc);
 						ResetOrderDialogState(gSession);
 						state = STATE_IDLE;
 						return;
-				}
-
-				if (order.Price1 > 0.0)
-				{
-					gSession.previewPrice = order.Price1;
-					gSession.hasPreviewPrice = true;
-					UpdatePreviewLine(sc, gSession.previewPrice);
 				}
 
 				HandleOrderFlow(sc, hwnd, order, isBuy, orderSummary, state);
 			}
 			else
 			{
-				ClearPreviewLine(sc);
 				ResetOrderDialogState(gSession);
 				state = STATE_IDLE;
 			}
@@ -2169,7 +2111,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 
 		if (gSession.orderDialogHwnd != nullptr && !IsWindow(gSession.orderDialogHwnd))
 		{
-			ClearPreviewLine(sc);
 			ResetOrderDialogState(gSession);
 			state = STATE_IDLE;
 			return;
@@ -2205,15 +2146,11 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 	gSession.orderQuantity = GetOrderQuantity(sc);
 	gSession.orderDialogDone = false;
 	gSession.orderDialogResult = false;
-	gSession.previewPrice = clickedPrice;
-	gSession.hasPreviewPrice = clickedPrice > 0.0 && std::isfinite(clickedPrice);
 	if (hasClickPt)
 	{
 		gSession.lastClickScreenPt = clickPt;
 		gSession.hasClickPoint = true;
 	}
-	if (gSession.hasPreviewPrice)
-		UpdatePreviewLine(sc, clickedPrice);
 
 	HWND orderDlg = StartOrderSelectionDialog(
 		hwnd,
@@ -2230,13 +2167,11 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 	}
 
 	// Fallback to legacy blocking menu if the modeless dialog could not be created.
-	ClearPreviewLine(sc);
 	ResetOrderDialogState(gSession);
 
 	UINT cmd = ShowOrderMenu(hwnd);
 	if (cmd == CMD_NONE || cmd == CMD_CANCEL)
 	{
-		ClearPreviewLine(sc);
 		ResetOrderDialogState(gSession);
 		state = STATE_IDLE;
 		return;
@@ -2297,9 +2232,6 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 
 	if (order.Price1 > 0.0)
 	{
-		gSession.previewPrice = order.Price1;
-		gSession.hasPreviewPrice = true;
-		UpdatePreviewLine(sc, gSession.previewPrice);
 	}
 
 	HandleOrderFlow(sc, hwnd, order, isBuy, orderSummary, state);
