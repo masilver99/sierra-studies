@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <cstdio>
 #include <cwctype>
 #include <fstream>
 #include <sstream>
@@ -91,11 +92,24 @@ namespace
 		s_SCNewOrder pendingOrder{};
 		bool pendingIsBuy = false;
 		std::wstring orderSummary;
+		std::string checklistJson;
+		HWND orderDialogHwnd = nullptr;
+		bool orderDialogDone = false;
+		bool orderDialogResult = false;
+		UINT orderDialogCmd = 0;
+		double clickedPrice = 0.0;
+		int orderQuantity = 0;
+		double previewPrice = 0.0;
+		bool hasPreviewPrice = false;
+		POINT lastClickScreenPt{};
+		bool hasClickPoint = false;
+		DWORD lastPopupTick = 0;
 	};
 
 	static TradeGateSession gSession;
 	constexpr int STATE_IDLE = 0;
 	constexpr int STATE_WAITING_DIALOG = 1;
+	constexpr int STATE_WAITING_ORDER = 2;
 
 	enum MenuCommand : UINT
 	{
@@ -163,6 +177,59 @@ namespace
 		return cmd;
 	}
 
+	static void ClearPreviewLine(SCStudyInterfaceRef sc)
+	{
+		int& lineId = sc.GetPersistentInt(3);
+		if (lineId != 0)
+		{
+			sc.DeleteACSChartDrawing(sc.ChartNumber, lineId, 0);
+			lineId = 0;
+		}
+	}
+
+	static void UpdatePreviewLine(SCStudyInterfaceRef sc, double price)
+	{
+		int& lineId = sc.GetPersistentInt(3);
+		if (!std::isfinite(price) || price <= 0.0)
+		{
+			ClearPreviewLine(sc);
+			return;
+		}
+
+		s_UseTool tool;
+		tool.Clear();
+		tool.ChartNumber = sc.ChartNumber;
+		tool.DrawingType = DRAWING_LINE;
+		tool.AddMethod = UTAM_ADD_OR_ADJUST;
+		tool.LineNumber = (lineId == 0) ? -1 : lineId;
+		tool.BeginIndex = 0;
+		const int forward = 200;
+		const int endIndex = (sc.ArraySize > 0 ? sc.ArraySize - 1 : 0) + forward;
+		tool.EndIndex = endIndex;
+		tool.BeginValue = (float)price;
+		tool.EndValue = (float)price;
+		tool.Color = RGB(255, 128, 0);
+		tool.LineWidth = 2;
+		tool.AddAsUserDrawnDrawing = 0;
+		sc.UseTool(tool);
+		if (lineId == 0)
+			lineId = tool.LineNumber;
+	}
+
+	static void ResetOrderDialogState(TradeGateSession& s)
+	{
+		s.orderDialogCmd = CMD_NONE;
+		s.orderDialogDone = false;
+		s.orderDialogResult = false;
+		s.orderDialogHwnd = nullptr;
+		s.clickedPrice = 0.0;
+		s.orderQuantity = 0;
+		s.previewPrice = 0.0;
+		s.hasPreviewPrice = false;
+		s.lastClickScreenPt = POINT{};
+		s.hasClickPoint = false;
+	}
+
 	static bool AskYesNoDetailed(
 		HWND hwnd,
 		const wchar_t* title,
@@ -171,6 +238,287 @@ namespace
 		const wchar_t* yesText,
 		const wchar_t* noText,
 		int defaultButtonId);
+
+	static std::wstring ToWideBestEffort(const SCString& s);
+	static std::wstring ToWideBestEffort(const std::string& s);
+
+	struct OrderDialogRuntime
+	{
+		TradeGateSession* session = nullptr;
+		double clickedPrice = 0.0;
+		double tickSize = 0.0;
+		int quantity = 1;
+	};
+
+	static std::wstring FormatPriceW(double price)
+	{
+		SCString s;
+		s.Format("%.8f", price);
+		return ToWideBestEffort(s);
+	}
+
+	static double PriceForCommand(const OrderDialogRuntime& rt, UINT cmd)
+	{
+		switch (cmd)
+		{
+			case CMD_BUY_LIMIT: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Nearest);
+			case CMD_BUY_STOP: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Up);
+			case CMD_SELL_LIMIT: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Up);
+			case CMD_SELL_STOP: return RoundToTick(rt.clickedPrice, rt.tickSize, TickRounding::Down);
+			default: return rt.clickedPrice;
+		}
+	}
+
+	static std::wstring ButtonLabel(const wchar_t* base, double price, bool showPrice)
+	{
+		if (!showPrice)
+			return base;
+		std::wstring label = base;
+		label += L" @ ";
+		label += FormatPriceW(price);
+		return label;
+	}
+
+	constexpr UINT IDC_ORDER_HEADER = 2201;
+
+	static void FinishOrderDialog(HWND hDlg, OrderDialogRuntime* rt, UINT cmd)
+	{
+		if (rt != nullptr)
+		{
+			TradeGateSession* session = rt->session;
+			if (session != nullptr)
+			{
+				session->orderDialogCmd = cmd;
+				session->orderDialogResult = (cmd != CMD_NONE);
+				session->orderDialogDone = true;
+				session->orderDialogHwnd = nullptr;
+				double preview = PriceForCommand(*rt, cmd);
+				session->previewPrice = preview;
+				session->hasPreviewPrice = std::isfinite(preview) && preview > 0.0;
+			}
+		}
+		DestroyWindow(hDlg);
+	}
+
+	static INT_PTR CALLBACK OrderDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+	{
+		auto* rt = reinterpret_cast<OrderDialogRuntime*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+		switch (msg)
+		{
+			case WM_INITDIALOG:
+			{
+				rt = reinterpret_cast<OrderDialogRuntime*>(lParam);
+				if (rt == nullptr)
+					return FALSE;
+				SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)rt);
+
+				const int margin = 12;
+				const int buttonWidth = 320;
+				const int buttonHeight = 30;
+				const int buttonGap = 8;
+
+				HFONT dlgFont = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
+				if (dlgFont == nullptr)
+					dlgFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+				std::wstring header = L"Order price at click: ";
+				header += FormatPriceW(rt->clickedPrice);
+				header += L"    Qty: ";
+				header += std::to_wstring(rt->quantity);
+
+				RECT textRc{0, 0, buttonWidth, 0};
+				HDC hdc = GetDC(hDlg);
+				if (hdc != nullptr)
+				{
+					DrawTextW(hdc, header.c_str(), (int)header.size(), &textRc, DT_CALCRECT | DT_WORDBREAK);
+					ReleaseDC(hDlg, hdc);
+				}
+				int headerH = textRc.bottom - textRc.top;
+				if (headerH < 24)
+					headerH = 24;
+
+				int y = margin;
+				HWND hHeader = CreateWindowExW(
+					0,
+					L"STATIC",
+					header.c_str(),
+					WS_CHILD | WS_VISIBLE,
+					margin,
+					y,
+					buttonWidth,
+					headerH,
+					hDlg,
+					(HMENU)(uintptr_t)IDC_ORDER_HEADER,
+					GetModuleHandleW(nullptr),
+					nullptr);
+				if (hHeader != nullptr)
+					SendMessageW(hHeader, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+
+				y += headerH + 10;
+
+				struct BtnDef { UINT id; const wchar_t* text; bool showPrice; };
+				BtnDef btns[] = {
+					{ CMD_BUY_MARKET, L"Buy Market", false },
+					{ CMD_BUY_LIMIT,  L"Buy Limit",  true },
+					{ CMD_BUY_STOP,   L"Buy Stop",   true },
+					{ CMD_SELL_MARKET, L"Sell Market", false },
+					{ CMD_SELL_LIMIT, L"Sell Limit", true },
+					{ CMD_SELL_STOP,  L"Sell Stop",  true },
+				};
+
+				for (const auto& b : btns)
+				{
+					double p = PriceForCommand(*rt, b.id);
+					std::wstring label = ButtonLabel(b.text, p, b.showPrice);
+					HWND hBtn = CreateWindowExW(
+						0,
+						L"BUTTON",
+						label.c_str(),
+						WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+						margin,
+						y,
+						buttonWidth,
+						buttonHeight,
+						hDlg,
+						(HMENU)(uintptr_t)b.id,
+						GetModuleHandleW(nullptr),
+						nullptr);
+					if (hBtn != nullptr)
+						SendMessageW(hBtn, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+					y += buttonHeight + buttonGap;
+				}
+
+				const int cancelWidth = 120;
+				HWND hCancel = CreateWindowExW(
+					0,
+					L"BUTTON",
+					L"Cancel",
+					WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+					margin,
+					y,
+					cancelWidth,
+					buttonHeight,
+					hDlg,
+					(HMENU)CMD_CANCEL,
+					GetModuleHandleW(nullptr),
+					nullptr);
+				if (hCancel != nullptr)
+					SendMessageW(hCancel, WM_SETFONT, (WPARAM)dlgFont, TRUE);
+
+				y += buttonHeight + margin;
+				const int width = buttonWidth + margin * 2;
+				SetWindowPos(hDlg, HWND_TOPMOST, 0, 0, width, y, SWP_NOMOVE);
+				return TRUE;
+			}
+			case WM_COMMAND:
+			{
+				const UINT id = LOWORD(wParam);
+				if (id == CMD_CANCEL)
+				{
+					FinishOrderDialog(hDlg, rt, CMD_NONE);
+					return TRUE;
+				}
+				if (id == CMD_BUY_MARKET || id == CMD_BUY_LIMIT || id == CMD_BUY_STOP
+					|| id == CMD_SELL_MARKET || id == CMD_SELL_LIMIT || id == CMD_SELL_STOP)
+				{
+					FinishOrderDialog(hDlg, rt, id);
+					return TRUE;
+				}
+				break;
+			}
+			case WM_CLOSE:
+			{
+				FinishOrderDialog(hDlg, rt, CMD_NONE);
+				return TRUE;
+			}
+			case WM_NCDESTROY:
+			{
+				if (rt != nullptr)
+				{
+					TradeGateSession* session = rt->session;
+					if (session != nullptr && session->orderDialogHwnd == hDlg)
+						session->orderDialogHwnd = nullptr;
+					delete rt;
+				}
+				SetWindowLongPtrW(hDlg, GWLP_USERDATA, 0);
+				return FALSE;
+			}
+		}
+		return FALSE;
+	}
+
+	static void PositionWindowNearPoint(HWND hwnd, POINT screenPt)
+	{
+		RECT rc{};
+		if (!GetWindowRect(hwnd, &rc))
+			return;
+
+		const int w = rc.right - rc.left;
+		const int h = rc.bottom - rc.top;
+		HMONITOR mon = MonitorFromPoint(screenPt, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi{};
+		mi.cbSize = sizeof(mi);
+		if (!GetMonitorInfoW(mon, &mi))
+			return;
+
+		int x = screenPt.x - w / 2;
+		int y = screenPt.y - h / 2;
+		const int minX = mi.rcWork.left;
+		const int maxX = mi.rcWork.right - w;
+		const int minY = mi.rcWork.top;
+		const int maxY = mi.rcWork.bottom - h;
+		x = std::clamp(x, minX, maxX);
+		y = std::clamp(y, minY, maxY);
+
+		SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	}
+
+	static HWND StartOrderSelectionDialog(HWND parent, TradeGateSession& session, double clickedPrice, int quantity, double tickSize, const POINT* clickScreenPt)
+	{
+		struct DialogTemplate
+		{
+			DLGTEMPLATE dlg;
+			WORD menu;
+			WORD windowClass;
+			WCHAR title[1];
+		};
+
+		DialogTemplate dt{};
+		dt.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+		dt.dlg.dwExtendedStyle = WS_EX_DLGMODALFRAME;
+		dt.dlg.cdit = 0;
+		dt.dlg.x = 10;
+		dt.dlg.y = 10;
+		dt.dlg.cx = 260;
+		dt.dlg.cy = 200;
+		dt.menu = 0;
+		dt.windowClass = 0;
+		dt.title[0] = L'\0';
+
+		OrderDialogRuntime* rt = new OrderDialogRuntime();
+		rt->session = &session;
+		rt->clickedPrice = clickedPrice;
+		rt->tickSize = tickSize;
+		rt->quantity = quantity > 0 ? quantity : 1;
+
+		HWND hDlg = CreateDialogIndirectParamW(
+			GetModuleHandleW(nullptr),
+			reinterpret_cast<LPCDLGTEMPLATEW>(&dt),
+			parent,
+			OrderDlgProc,
+			reinterpret_cast<LPARAM>(rt));
+
+		if (hDlg == nullptr)
+		{
+			delete rt;
+			return nullptr;
+		}
+
+		ShowWindow(hDlg, SW_SHOWNORMAL);
+		if (clickScreenPt != nullptr)
+			PositionWindowNearPoint(hDlg, *clickScreenPt);
+		return hDlg;
+	}
 
 	struct ChecklistDialogParams
 	{
@@ -270,6 +618,38 @@ namespace
 		std::string out;
 		out.resize((size_t)needed - 1);
 		WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, out.data(), needed, nullptr, nullptr);
+		return out;
+	}
+
+	static std::string JsonEscape(const std::string& s)
+	{
+		std::string out;
+		out.reserve(s.size() + 8);
+		for (unsigned char c : s)
+		{
+			switch (c)
+			{
+				case '"': out += "\\\""; break;
+				case '\\': out += "\\\\"; break;
+				case '\b': out += "\\b"; break;
+				case '\f': out += "\\f"; break;
+				case '\n': out += "\\n"; break;
+				case '\r': out += "\\r"; break;
+				case '\t': out += "\\t"; break;
+				default:
+					if (c < 0x20)
+					{
+						char buf[7];
+						snprintf(buf, sizeof(buf), "\\u%04x", c);
+						out += buf;
+					}
+					else
+					{
+						out.push_back((char)c);
+					}
+					break;
+			}
+		}
 		return out;
 	}
 
@@ -613,7 +993,8 @@ namespace
 
 		struct ChecklistDialogRuntime
 		{
-			ChecklistDialogParams* params = nullptr;
+			ChecklistDialogParams params{};
+			bool hasParams = false;
 			TradeGateSession* session = nullptr;
 			std::wstring mainText;
 			struct ControlRef
@@ -622,6 +1003,7 @@ namespace
 				bool required = false;
 				UINT idFirst = 0;
 				int optionCount = 0;
+				size_t itemIndex = 0;
 			};
 			std::vector<ControlRef> controls;
 		};
@@ -756,10 +1138,137 @@ namespace
 				EnableWindow(hOk, ok ? TRUE : FALSE);
 		}
 
+		static std::wstring ReadWindowText(HWND h)
+		{
+			if (h == nullptr)
+				return {};
+			int len = GetWindowTextLengthW(h);
+			if (len <= 0)
+				return {};
+			std::wstring out;
+			out.resize((size_t)len);
+			GetWindowTextW(h, out.data(), len + 1);
+			return out;
+		}
+
+		static std::string CollectChecklistResponses(HWND hDlg, const ChecklistDialogRuntime& runtime)
+		{
+			if (!runtime.hasParams)
+				return {};
+
+			const auto& items = runtime.params.items;
+			std::string json;
+			json.reserve(256);
+			json += "{\"items\":";
+			json += "{";
+			bool first = true;
+			for (const auto& c : runtime.controls)
+			{
+				if (c.itemIndex >= items.size())
+					continue;
+				const auto& item = items[c.itemIndex];
+				std::string key = JsonEscape(ToUtf8(item.id));
+				std::string valueJson;
+				switch (item.type)
+				{
+					case ChecklistDialogParams::Item::Type::Checkbox:
+					{
+						HWND h = GetDlgItem(hDlg, (int)c.idFirst);
+						const bool checked = (h != nullptr && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED);
+						valueJson = checked ? "true" : "false";
+						break;
+					}
+					case ChecklistDialogParams::Item::Type::Text:
+					case ChecklistDialogParams::Item::Type::TextArea:
+					{
+						HWND h = GetDlgItem(hDlg, (int)c.idFirst);
+						std::wstring w = ReadWindowText(h);
+						std::string utf8 = ToUtf8(w);
+						valueJson = "\"" + JsonEscape(utf8) + "\"";
+						break;
+					}
+					case ChecklistDialogParams::Item::Type::Dropdown:
+					{
+						HWND h = GetDlgItem(hDlg, (int)c.idFirst);
+						LRESULT sel = (h != nullptr) ? SendMessageW(h, CB_GETCURSEL, 0, 0) : (LRESULT)CB_ERR;
+						if (sel != CB_ERR && sel >= 0 && sel < (LRESULT)item.options.size())
+						{
+							std::string utf8 = ToUtf8(item.options[(size_t)sel]);
+							valueJson = "\"" + JsonEscape(utf8) + "\"";
+						}
+						else
+						{
+							valueJson = "null";
+						}
+						break;
+					}
+					case ChecklistDialogParams::Item::Type::Radio:
+					{
+						std::wstring choice;
+						for (int i = 0; i < c.optionCount; ++i)
+						{
+							HWND h = GetDlgItem(hDlg, (int)c.idFirst + i);
+							if (h != nullptr && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED)
+							{
+								if ((size_t)i < item.options.size())
+									choice = item.options[(size_t)i];
+								break;
+							}
+						}
+						if (!choice.empty())
+						{
+							std::string utf8 = ToUtf8(choice);
+							valueJson = "\"" + JsonEscape(utf8) + "\"";
+						}
+						else
+						{
+							valueJson = "null";
+						}
+						break;
+					}
+					case ChecklistDialogParams::Item::Type::MultiCheckbox:
+					{
+						std::vector<std::string> selected;
+						for (int i = 0; i < c.optionCount; ++i)
+						{
+							HWND h = GetDlgItem(hDlg, (int)c.idFirst + i);
+							if (h != nullptr && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED)
+							{
+								if ((size_t)i < item.options.size())
+									selected.push_back(ToUtf8(item.options[(size_t)i]));
+							}
+						}
+						valueJson = "[";
+						for (size_t i = 0; i < selected.size(); ++i)
+						{
+							if (i > 0)
+								valueJson += ",";
+							valueJson += "\"" + JsonEscape(selected[i]) + "\"";
+						}
+						valueJson += "]";
+						break;
+					}
+					default:
+						valueJson = "null";
+						break;
+				}
+
+				if (!first)
+					json += ",";
+				json += "\"" + key + "\":" + valueJson;
+				first = false;
+			}
+			json += "}";
+			json += ",\"finalConfirm\":";
+			json += runtime.params.finalConfirm ? "true" : "false";
+			json += "}";
+			return json;
+		}
+
 		static INT_PTR CALLBACK ChecklistDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 		{
 			auto* runtime = reinterpret_cast<ChecklistDialogRuntime*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
-			ChecklistDialogParams* params = runtime != nullptr ? runtime->params : nullptr;
+			ChecklistDialogParams* params = (runtime != nullptr && runtime->hasParams) ? &runtime->params : nullptr;
 			switch (msg)
 			{
 				case WM_INITDIALOG:
@@ -768,7 +1277,7 @@ namespace
 					if (runtime == nullptr)
 						return FALSE;
 					SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)runtime);
-					params = runtime != nullptr ? runtime->params : nullptr;
+					params = (runtime != nullptr && runtime->hasParams) ? &runtime->params : nullptr;
 					if (params != nullptr && params->title != nullptr)
 						SetWindowTextW(hDlg, params->title);
 
@@ -904,8 +1413,9 @@ namespace
 					hdc = GetDC(hDlg);
 					if (params != nullptr)
 					{
-						for (const auto& item : params->items)
+						for (size_t itemIndex = 0; itemIndex < params->items.size(); ++itemIndex)
 						{
+							const auto& item = params->items[itemIndex];
 							int labelH = MeasureWrappedTextHeight(hdc, dlgFont, item.label.c_str(), width);
 							if (labelH < 18) labelH = 18;
 
@@ -933,7 +1443,7 @@ namespace
 									if (!item.defaultValue.empty())
 										SendMessageW(hCheck, BM_SETCHECK, (WPARAM)BST_CHECKED, 0);
 								}
-								runtime->controls.push_back({item.type, item.required, id, 1});
+								runtime->controls.push_back({item.type, item.required, id, 1, itemIndex});
 								y += qh + 8;
 								continue;
 							}
@@ -990,7 +1500,7 @@ namespace
 										if (!item.placeholder.empty())
 											SendMessageW(hEdit, EM_SETCUEBANNER, (WPARAM)TRUE, (LPARAM)item.placeholder.c_str());
 									}
-									runtime->controls.push_back({item.type, item.required, id, 1});
+									runtime->controls.push_back({item.type, item.required, id, 1, itemIndex});
 									y += h + 10;
 									break;
 								}
@@ -1027,7 +1537,7 @@ namespace
 											}
 										}
 									}
-									runtime->controls.push_back({item.type, item.required, id, 1});
+									runtime->controls.push_back({item.type, item.required, id, 1, itemIndex});
 									y += 28 + 10;
 									break;
 								}
@@ -1090,7 +1600,7 @@ namespace
 
 										y += oh + 4;
 									}
-									runtime->controls.push_back({item.type, item.required, first, optCount});
+									runtime->controls.push_back({item.type, item.required, first, optCount, itemIndex});
 									y += 6;
 									break;
 								}
@@ -1155,6 +1665,7 @@ namespace
 							session->checklistResult = false;
 							session->checklistDone = true;
 							session->checklistHwnd = nullptr;
+							session->checklistJson.clear();
 						}
 						DestroyWindow(hDlg);
 						return TRUE;
@@ -1167,6 +1678,8 @@ namespace
 						{
 							if (session != nullptr)
 							{
+								if (runtime != nullptr)
+									session->checklistJson = CollectChecklistResponses(hDlg, *runtime);
 								session->checklistResult = true;
 								session->checklistDone = true;
 								session->checklistHwnd = nullptr;
@@ -1192,6 +1705,7 @@ namespace
 						session->checklistResult = false;
 						session->checklistDone = true;
 						session->checklistHwnd = nullptr;
+						session->checklistJson.clear();
 					}
 					DestroyWindow(hDlg);
 					return TRUE;
@@ -1237,9 +1751,10 @@ namespace
 		dt.windowClass = 0;
 		dt.title[0] = L'\0';
 
-		ChecklistDialogRuntime* runtime = new ChecklistDialogRuntime();
-		runtime->params = &params;
-		runtime->session = &session;
+			ChecklistDialogRuntime* runtime = new ChecklistDialogRuntime();
+			runtime->params = params;
+			runtime->hasParams = true;
+			runtime->session = &session;
 
 		HWND hDlg = CreateDialogIndirectParamW(
 			GetModuleHandleW(nullptr),
@@ -1268,7 +1783,7 @@ namespace
 		return fixedQty > 0 ? fixedQty : 1;
 	}
 
-	static double GetClickedPrice(SCStudyInterfaceRef sc, HWND hwnd)
+	static double GetClickedPrice(SCStudyInterfaceRef sc, HWND hwnd, const POINT* screenPoint)
 	{
 		const bool debug = sc.Input[INPUT_DEBUG_LOG].GetYesNo();
 
@@ -1278,7 +1793,11 @@ namespace
 		if (hwnd != nullptr)
 		{
 			POINT pt{};
-			if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt))
+			if (screenPoint != nullptr)
+				pt = *screenPoint;
+			else
+				GetCursorPos(&pt);
+			if (ScreenToClient(hwnd, &pt))
 			{
 				pixelPrice = sc.YPixelCoordinateToGraphValue(pt.y);
 				pixelOk = true;
@@ -1321,6 +1840,94 @@ namespace
 			return 0.0;
 		}
 		return price;
+	}
+
+	static void HandleOrderFlow(
+		SCStudyInterfaceRef sc,
+		HWND hwnd,
+		s_SCNewOrder order,
+		bool isBuy,
+		const std::wstring& orderSummary,
+		int& state)
+	{
+		ChecklistDialogParams params;
+		std::wstring checklistError;
+		if (!BuildChecklistParams(sc, orderSummary, params, checklistError))
+		{
+			SCString msg = "Trade Gate: Checklist init failed.";
+			if (!checklistError.empty())
+			{
+				std::string utf8 = ToUtf8(checklistError);
+				if (!utf8.empty())
+				{
+					msg += " Detail: ";
+					msg += utf8.c_str();
+				}
+			}
+			sc.AddMessageToLog(msg, 1);
+			ClearPreviewLine(sc);
+			ResetOrderDialogState(gSession);
+			return;
+		}
+
+		const bool checklistEnabled = sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo();
+		const bool needDialog = checklistEnabled && (!params.items.empty() || params.finalConfirm);
+		if (needDialog)
+		{
+			gSession.checklistDone = false;
+			gSession.checklistResult = false;
+			gSession.checklistJson.clear();
+			gSession.pendingOrder = order;
+			gSession.pendingIsBuy = isBuy;
+			gSession.orderSummary = orderSummary;
+			HWND dlg = StartChecklistCheckboxDialog(hwnd, params, gSession);
+			if (dlg == nullptr)
+			{
+				sc.AddMessageToLog("Trade Gate: Could not create checklist dialog.", 1);
+				gSession.checklistDone = false;
+				gSession.pendingIsBuy = false;
+				ClearPreviewLine(sc);
+				ResetOrderDialogState(gSession);
+				return;
+			}
+			gSession.checklistHwnd = dlg;
+			state = STATE_WAITING_DIALOG;
+			return;
+		}
+
+		double result = isBuy ? sc.BuyEntry(order) : sc.SellEntry(order);
+		if (result <= 0.0)
+		{
+			const int resultCode = (int)result;
+			const char* resultText = sc.GetTradingErrorTextMessage(resultCode);
+			if (resultText == nullptr)
+				resultText = "";
+
+			SCString msg;
+			msg.Format(
+				"Trade Gate: Order rejected (Result=%d '%s', Type=%d, Qty=%d, Price1=%.8f, Replay=%d, ReplayStatus=%d, Sim=%d, SendOrders=%d, AutoTrading=%d, AutoTradingChart=%d, TradingLocked=%u)",
+				resultCode,
+				resultText,
+				(int)order.OrderType,
+				(int)order.OrderQuantity,
+				order.Price1,
+				sc.IsReplayRunning(),
+				sc.ReplayStatus,
+				sc.GlobalTradeSimulationIsOn,
+				sc.SendOrdersToTradeService,
+				sc.IsAutoTradingEnabled,
+				sc.IsAutoTradingOptionEnabledForChart,
+				(unsigned)sc.TradingIsLocked);
+			sc.AddMessageToLog(msg, 1);
+		}
+		else
+		{
+			sc.AddMessageToLog("Trade Gate: Order submitted.", 0);
+		}
+
+		ClearPreviewLine(sc);
+		ResetOrderDialogState(gSession);
+		state = STATE_IDLE;
 	}
 }
 
@@ -1381,19 +1988,39 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 
 	// Do not run trading logic during full chart recalculation; submissions would be skipped.
 	if (sc.IsFullRecalculation)
+	{
+		ClearPreviewLine(sc);
 		return;
+	}
 
-	if (!sc.Input[INPUT_ENABLE].GetYesNo())	return;
+	if (!sc.Input[INPUT_ENABLE].GetYesNo())	
+	{
+		ClearPreviewLine(sc);
+		return;
+	}
 
 	int& state = sc.GetPersistentInt(1);
 	int& PrevLButtonDown = sc.GetPersistentInt(2);
 
+	if (state == STATE_IDLE)
+	{
+		// Safety: ensure any stray preview line is cleared when idle.
+		ClearPreviewLine(sc);
+	}
+
 	if (state == STATE_WAITING_DIALOG)
 	{
+		if (gSession.hasPreviewPrice)
+			UpdatePreviewLine(sc, gSession.previewPrice);
+		else
+			ClearPreviewLine(sc);
+
 		if (gSession.checklistDone)
 		{
 			if (gSession.checklistResult)
 			{
+				if (!gSession.checklistJson.empty())
+					gSession.pendingOrder.TextTag = gSession.checklistJson.c_str();
 				double result = gSession.pendingIsBuy ? sc.BuyEntry(gSession.pendingOrder) : sc.SellEntry(gSession.pendingOrder);
 				if (result <= 0.0)
 				{
@@ -1433,6 +2060,9 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			gSession.checklistResult = false;
 			gSession.pendingOrder = s_SCNewOrder{};
 			gSession.pendingIsBuy = false;
+			gSession.checklistJson.clear();
+			ClearPreviewLine(sc);
+			ResetOrderDialogState(gSession);
 			state = STATE_IDLE;
 			return;
 		}
@@ -1442,8 +2072,109 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			gSession.checklistHwnd = nullptr;
 			gSession.checklistDone = false;
 			gSession.checklistResult = false;
+			gSession.checklistJson.clear();
+			ClearPreviewLine(sc);
+			ResetOrderDialogState(gSession);
 			state = STATE_IDLE;
 		}
+		return;
+	}
+
+	if (state == STATE_WAITING_ORDER)
+	{
+		HWND hwnd = GetChartHwnd(sc);
+		if (gSession.hasPreviewPrice)
+			UpdatePreviewLine(sc, gSession.previewPrice);
+		else
+			ClearPreviewLine(sc);
+
+		if (gSession.orderDialogDone)
+		{
+			if (gSession.orderDialogResult && gSession.orderDialogCmd != CMD_NONE)
+			{
+				s_SCNewOrder order{};
+				order.Price1 = 0.0;
+				order.OrderQuantity = gSession.orderQuantity > 0 ? gSession.orderQuantity : GetOrderQuantity(sc);
+
+				bool isBuy = false;
+				std::wstring orderSummary;
+				auto formatPrice = [&](double price) -> std::wstring
+				{
+					SCString s;
+					s.Format("%.8f", price);
+					return ToWideBestEffort(s);
+				};
+
+				switch (gSession.orderDialogCmd)
+				{
+					case CMD_BUY_MARKET:
+						isBuy = true;
+						order.OrderType = SCT_ORDERTYPE_MARKET;
+						orderSummary = L"Order: Buy Market";
+						break;
+					case CMD_BUY_LIMIT:
+						isBuy = true;
+						order.OrderType = SCT_ORDERTYPE_LIMIT;
+						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Nearest);
+						orderSummary = L"Order: Buy Limit @ " + formatPrice(order.Price1);
+						break;
+					case CMD_BUY_STOP:
+						isBuy = true;
+						order.OrderType = SCT_ORDERTYPE_STOP;
+						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Up);
+						orderSummary = L"Order: Buy Stop @ " + formatPrice(order.Price1);
+						break;
+					case CMD_SELL_MARKET:
+						isBuy = false;
+						order.OrderType = SCT_ORDERTYPE_MARKET;
+						orderSummary = L"Order: Sell Market";
+						break;
+					case CMD_SELL_LIMIT:
+						isBuy = false;
+						order.OrderType = SCT_ORDERTYPE_LIMIT;
+						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Up);
+						orderSummary = L"Order: Sell Limit @ " + formatPrice(order.Price1);
+						break;
+					case CMD_SELL_STOP:
+						isBuy = false;
+						order.OrderType = SCT_ORDERTYPE_STOP;
+						order.Price1 = RoundToTick(gSession.clickedPrice, sc.TickSize, TickRounding::Down);
+						orderSummary = L"Order: Sell Stop @ " + formatPrice(order.Price1);
+						break;
+					default:
+						ClearPreviewLine(sc);
+						ResetOrderDialogState(gSession);
+						state = STATE_IDLE;
+						return;
+				}
+
+				if (order.Price1 > 0.0)
+				{
+					gSession.previewPrice = order.Price1;
+					gSession.hasPreviewPrice = true;
+					UpdatePreviewLine(sc, gSession.previewPrice);
+				}
+
+				HandleOrderFlow(sc, hwnd, order, isBuy, orderSummary, state);
+			}
+			else
+			{
+				ClearPreviewLine(sc);
+				ResetOrderDialogState(gSession);
+				state = STATE_IDLE;
+			}
+			gSession.orderDialogDone = false;
+			return;
+		}
+
+		if (gSession.orderDialogHwnd != nullptr && !IsWindow(gSession.orderDialogHwnd))
+		{
+			ClearPreviewLine(sc);
+			ResetOrderDialogState(gSession);
+			state = STATE_IDLE;
+			return;
+		}
+
 		return;
 	}
 
@@ -1465,14 +2196,54 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 
 	// Capture the chart price exactly at the click point before the menu opens
 	// so mouse movement while choosing a menu item does not shift the price.
-	const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd));
+	POINT clickPt{};
+	const bool hasClickPt = GetCursorPos(&clickPt) != FALSE;
+	const double clickedPrice = SanitizePrice(sc, GetClickedPrice(sc, hwnd, hasClickPt ? &clickPt : nullptr));
+
+	ResetOrderDialogState(gSession);
+	gSession.clickedPrice = clickedPrice;
+	gSession.orderQuantity = GetOrderQuantity(sc);
+	gSession.orderDialogDone = false;
+	gSession.orderDialogResult = false;
+	gSession.previewPrice = clickedPrice;
+	gSession.hasPreviewPrice = clickedPrice > 0.0 && std::isfinite(clickedPrice);
+	if (hasClickPt)
+	{
+		gSession.lastClickScreenPt = clickPt;
+		gSession.hasClickPoint = true;
+	}
+	if (gSession.hasPreviewPrice)
+		UpdatePreviewLine(sc, clickedPrice);
+
+	HWND orderDlg = StartOrderSelectionDialog(
+		hwnd,
+		gSession,
+		clickedPrice,
+		gSession.orderQuantity,
+		sc.TickSize,
+		gSession.hasClickPoint ? &gSession.lastClickScreenPt : nullptr);
+	if (orderDlg != nullptr)
+	{
+		gSession.orderDialogHwnd = orderDlg;
+		state = STATE_WAITING_ORDER;
+		return;
+	}
+
+	// Fallback to legacy blocking menu if the modeless dialog could not be created.
+	ClearPreviewLine(sc);
+	ResetOrderDialogState(gSession);
 
 	UINT cmd = ShowOrderMenu(hwnd);
 	if (cmd == CMD_NONE || cmd == CMD_CANCEL)
+	{
+		ClearPreviewLine(sc);
+		ResetOrderDialogState(gSession);
+		state = STATE_IDLE;
 		return;
+	}
 
 	s_SCNewOrder order{};
-	order.Price1 = 0.0; // avoid sentinel values if the backend inspects Price1 on market orders
+	order.Price1 = 0.0;
 	order.OrderQuantity = GetOrderQuantity(sc);
 
 	bool isBuy = false;
@@ -1524,73 +2295,12 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 			return;
 	}
 
-	ChecklistDialogParams params;
-	std::wstring checklistError;
-	if (!BuildChecklistParams(sc, orderSummary, params, checklistError))
+	if (order.Price1 > 0.0)
 	{
-		SCString msg = "Trade Gate: Checklist init failed.";
-		if (!checklistError.empty())
-		{
-			std::string utf8 = ToUtf8(checklistError);
-			if (!utf8.empty())
-			{
-				msg += " Detail: ";
-				msg += utf8.c_str();
-			}
-		}
-		sc.AddMessageToLog(msg, 1);
-		return;
+		gSession.previewPrice = order.Price1;
+		gSession.hasPreviewPrice = true;
+		UpdatePreviewLine(sc, gSession.previewPrice);
 	}
 
-	const bool checklistEnabled = sc.Input[INPUT_CHECKLIST_ENABLED].GetYesNo();
-	const bool needDialog = checklistEnabled && (!params.items.empty() || params.finalConfirm);
-	if (needDialog)
-	{
-		gSession.checklistDone = false;
-		gSession.checklistResult = false;
-		gSession.pendingOrder = order;
-		gSession.pendingIsBuy = isBuy;
-		gSession.orderSummary = orderSummary;
-		HWND dlg = StartChecklistCheckboxDialog(hwnd, params, gSession);
-		if (dlg == nullptr)
-		{
-			sc.AddMessageToLog("Trade Gate: Could not create checklist dialog.", 1);
-			gSession.checklistDone = false;
-			gSession.pendingIsBuy = false;
-			return;
-		}
-		gSession.checklistHwnd = dlg;
-		state = STATE_WAITING_DIALOG;
-		return;
-	}
-
-	double result = isBuy ? sc.BuyEntry(order) : sc.SellEntry(order);
-	if (result <= 0.0)
-	{
-		const int resultCode = (int)result;
-		const char* resultText = sc.GetTradingErrorTextMessage(resultCode);
-		if (resultText == nullptr)
-			resultText = "";
-
-		SCString msg;
-		msg.Format(
-			"Trade Gate: Order rejected (Result=%d '%s', Type=%d, Qty=%d, Price1=%.8f, Replay=%d, ReplayStatus=%d, Sim=%d, SendOrders=%d, AutoTrading=%d, AutoTradingChart=%d, TradingLocked=%u)",
-			resultCode,
-			resultText,
-			(int)order.OrderType,
-			(int)order.OrderQuantity,
-			order.Price1,
-			sc.IsReplayRunning(),
-			sc.ReplayStatus,
-			sc.GlobalTradeSimulationIsOn,
-			sc.SendOrdersToTradeService,
-			sc.IsAutoTradingEnabled,
-			sc.IsAutoTradingOptionEnabledForChart,
-			(unsigned)sc.TradingIsLocked);
-		sc.AddMessageToLog(msg, 1);
-	}
-	else
-	{
-		sc.AddMessageToLog("Trade Gate: Order submitted.", 0);
-	}
+	HandleOrderFlow(sc, hwnd, order, isBuy, orderSummary, state);
 }
