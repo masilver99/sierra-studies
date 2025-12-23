@@ -69,7 +69,7 @@ namespace
 		INPUT_ENABLE = 0,
 		INPUT_USE_TRADE_WINDOW_QTY = 1,
 		INPUT_FIXED_QTY = 2,
-		INPUT_REQUIRE_SHIFT = 3,
+		INPUT_REQUIRE_SPACE_TAP = 3,
 		INPUT_CHECKLIST_ENABLED = 4,
 		INPUT_CHECK_1_TEXT = 5,
 		INPUT_CHECK_2_TEXT = 6,
@@ -138,11 +138,6 @@ namespace
 			return false;
 		HWND w = WindowFromPoint(pt);
 		return (w == hwnd) || (w != nullptr && IsChild(hwnd, w));
-	}
-
-	static bool GetShiftDown()
-	{
-		return (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 	}
 
 	static UINT ShowOrderMenu(HWND hwnd)
@@ -1901,8 +1896,8 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 {
 	if (sc.SetDefaults)
 	{
-		sc.GraphName = "Trade Gate (SHIFT + Left Click)";
-		sc.StudyDescription = "SHIFT+LeftClick opens an order menu, runs a checklist gate (legacy inputs or JSON config), and submits the selected order programmatically.";
+		sc.GraphName = "Trade Gate (Left Button + Space)";
+		sc.StudyDescription = "Hold Left Button and tap Space to open an order menu, run a checklist gate (legacy inputs or JSON config), and submit the selected order programmatically.";
 		sc.GraphRegion = 1;
 		sc.AutoLoop = 0;
 		sc.ReceivePointerEvents = ACS_RECEIVE_POINTER_EVENTS_ALWAYS;
@@ -1925,8 +1920,8 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		sc.Input[INPUT_FIXED_QTY].SetInt(1);
 		sc.Input[INPUT_FIXED_QTY].SetIntLimits(1, 1000);
 
-		sc.Input[INPUT_REQUIRE_SHIFT].Name = "Require SHIFT modifier";
-		sc.Input[INPUT_REQUIRE_SHIFT].SetYesNo(true);
+		sc.Input[INPUT_REQUIRE_SPACE_TAP].Name = "Activation chord: Left Button + Space (always required)";
+		sc.Input[INPUT_REQUIRE_SPACE_TAP].SetYesNo(true);
 
 		sc.Input[INPUT_CHECKLIST_ENABLED].Name = "Enable Checklist Gate";
 		sc.Input[INPUT_CHECKLIST_ENABLED].SetYesNo(true);
@@ -1965,6 +1960,7 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 
 	int& state = sc.GetPersistentInt(1);
 	int& PrevLButtonDown = sc.GetPersistentInt(2);
+	int& PrevSpaceDown = sc.GetPersistentInt(3);
 
 	if (state == STATE_WAITING_DIALOG)
 	{
@@ -2119,16 +2115,15 @@ SCSFExport scsf_TradeGate(SCStudyInterfaceRef sc)
 		return;
 	}
 
-	// Reliable click detection: poll for a left-button down edge while SHIFT is held,
+	// Reliable activation: require the left mouse button to be held down and a fresh Space key tap,
 	// and only when the cursor is actually over this chart window.
 	const bool lDown = (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
-	const bool justPressed = lDown && (PrevLButtonDown == 0);
+	const bool spaceDown = (GetKeyState(VK_SPACE) & 0x8000) != 0;
+	const bool spaceTapped = spaceDown && (PrevSpaceDown == 0);
 	PrevLButtonDown = lDown ? 1 : 0;
+	PrevSpaceDown = spaceDown ? 1 : 0;
 
-	if (!justPressed)
-		return;
-
-	if (sc.Input[INPUT_REQUIRE_SHIFT].GetYesNo() && !GetShiftDown())
+	if (!spaceTapped || !lDown)
 		return;
 
 	HWND hwnd = GetChartHwnd(sc);
