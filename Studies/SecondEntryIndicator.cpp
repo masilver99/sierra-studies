@@ -261,7 +261,8 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
         Subgraph_L1[i] = 0;
         
         // Need enough bars for analysis
-        if (i < swingBars + 10)
+        const int minBarsForAnalysis = swingBars + 10;
+        if (i < minBarsForAnalysis)
             continue;
         
         // Determine trend direction based on price relative to EMA
