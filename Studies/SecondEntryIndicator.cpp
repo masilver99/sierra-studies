@@ -1,9 +1,65 @@
 #include "sierrachart.h"
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 SCDLLName("Al Brooks Second Entry Indicator");
 
 /*==========================================================================*/
+/*
+    Al Brooks Second Entry Indicator
+    
+    DESCRIPTION:
+    This indicator identifies "Second Entry" trading setups based on Al Brooks'
+    price action trading methodology. It marks H1/H2 (long) and L1/L2 (short)
+    entry points that occur after two-legged pullbacks in trending markets.
+    
+    CONCEPTS:
+    - H1 (High 1): First higher high in an uptrend after a pullback
+    - H2 (High 2): Second higher high after another pullback (BEST ENTRY)
+    - L1 (Low 1): First lower low in a downtrend after a pullback
+    - L2 (Low 2): Second lower low after another pullback (BEST ENTRY)
+    
+    WHY SECOND ENTRIES WORK:
+    According to Al Brooks, the first entry (H1 or L1) often traps early traders.
+    The second entry (H2 or L2) has a higher probability of success because:
+    1. Weak hands have been shaken out on the first attempt
+    2. The trend has proven itself twice
+    3. Counter-trend traders have failed twice
+    
+    USAGE:
+    1. Add this study to your chart
+    2. Configure the 20 EMA period (default) as trend filter
+    3. Look for green arrows below price (H2 long signals)
+    4. Look for red arrows above price (L2 short signals)
+    5. Optional: Enable H1/L1 markers to see first entries
+    6. Optional: Require pullback to test EMA (more conservative)
+    
+    TRADING RULES:
+    - Only take long signals (H2) when price is above EMA (bullish trend)
+    - Only take short signals (L2) when price is below EMA (bearish trend)
+    - Enter on breakout above/below the signal bar
+    - Use appropriate stop loss based on recent swing points
+    - Consider higher time frame trend for confirmation
+    
+    PARAMETERS:
+    - EMA Period: Default 20 (Al Brooks' preferred moving average)
+    - Swing Bars: 2 bars on each side to confirm swing high/low
+    - Lookback: 50 bars to search for pattern
+    - Min/Max Pullback Bars: Define valid pullback duration
+    - Require EMA Test: Only signal when pullback tests the EMA
+    
+    REFERENCES:
+    - Al Brooks "Trading Price Action Trends"
+    - Al Brooks "Reading Price Charts Bar by Bar"
+    - Price Action Trading methodology
+    
+    AUTHOR: Based on Al Brooks and Ali's trading teachings
+    VERSION: 1.0
+    DATE: 2026-02-18
+*/
+/*==========================================================================*/
+
 // Structure to track swing points
 struct SwingPoint
 {
