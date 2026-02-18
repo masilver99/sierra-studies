@@ -143,6 +143,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
     SCInputRef Input_RequireEMATest = sc.Input[7];
     SCInputRef Input_EMATestTicks = sc.Input[8];
     SCInputRef Input_MaxBarsAfterPullback = sc.Input[9];
+    SCInputRef Input_ArrowOffsetTicks = sc.Input[10];
     
     if (sc.SetDefaults)
     {
@@ -234,6 +235,11 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
         Input_MaxBarsAfterPullback.SetIntLimits(1, 50);
         Input_MaxBarsAfterPullback.SetDescription("Maximum bars after pullback completion to look for entry signal.");
         
+        Input_ArrowOffsetTicks.Name = "Arrow Offset (Ticks)";
+        Input_ArrowOffsetTicks.SetInt(5);
+        Input_ArrowOffsetTicks.SetIntLimits(1, 50);
+        Input_ArrowOffsetTicks.SetDescription("Visual offset in ticks for arrow markers from price bars.");
+        
         return;
     }
     
@@ -250,6 +256,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
     const bool requireEMATest = Input_RequireEMATest.GetYesNo();
     const int emaTestTicks = Input_EMATestTicks.GetInt();
     const int maxBarsAfterPullback = Input_MaxBarsAfterPullback.GetInt();
+    const int arrowOffsetTicks = Input_ArrowOffsetTicks.GetInt();
     
     // Manual loop through bars
     for (int i = sc.UpdateStartIndex; i < sc.ArraySize; i++)
@@ -260,8 +267,8 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
         Subgraph_H1[i] = 0;
         Subgraph_L1[i] = 0;
         
-        // Need enough bars for analysis
-        const int minBarsForAnalysis = swingBars + 10;
+        // Need enough bars for analysis (swing bars plus some history for pattern detection)
+        const int minBarsForAnalysis = swingBars + lookback / 5;  // At least 20% of lookback period
         if (i < minBarsForAnalysis)
             continue;
         
@@ -353,11 +360,11 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                                 {
                                     // Mark H1
                                     if (showH1L1 && Subgraph_H1[h1Index] == 0)
-                                        Subgraph_H1[h1Index] = sc.Low[h1Index] - sc.TickSize * 5;
+                                        Subgraph_H1[h1Index] = sc.Low[h1Index] - sc.TickSize * arrowOffsetTicks;
                                     
                                     // Mark H2 (Second Entry Long Signal)
                                     if (showH2L2)
-                                        Subgraph_H2Long[i] = sc.Low[i] - sc.TickSize * 5;
+                                        Subgraph_H2Long[i] = sc.Low[i] - sc.TickSize * arrowOffsetTicks;
                                 }
                             }
                         }
@@ -416,11 +423,11 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                                 {
                                     // Mark L1
                                     if (showH1L1 && Subgraph_L1[l1Index] == 0)
-                                        Subgraph_L1[l1Index] = sc.High[l1Index] + sc.TickSize * 5;
+                                        Subgraph_L1[l1Index] = sc.High[l1Index] + sc.TickSize * arrowOffsetTicks;
                                     
                                     // Mark L2 (Second Entry Short Signal)
                                     if (showH2L2)
-                                        Subgraph_L2Short[i] = sc.High[i] + sc.TickSize * 5;
+                                        Subgraph_L2Short[i] = sc.High[i] + sc.TickSize * arrowOffsetTicks;
                                 }
                             }
                         }
