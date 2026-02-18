@@ -268,7 +268,8 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
         Subgraph_L1[i] = 0;
         
         // Need enough bars for analysis (swing bars plus some history for pattern detection)
-        const int minBarsForAnalysis = swingBars + lookback / 5;  // At least 20% of lookback period
+        // Use at least 20% of lookback period to ensure we have sufficient data for swing detection
+        const int minBarsForAnalysis = swingBars + lookback / 5;
         if (i < minBarsForAnalysis)
             continue;
         
