@@ -313,9 +313,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                     recentSwings[idx+2].IsHigh && !recentSwings[idx+3].IsHigh)
                 {
                     float initialHigh = recentSwings[idx].Price;
-                    float pullback1Low = recentSwings[idx+1].Price;
                     float h1High = recentSwings[idx+2].Price;
-                    float pullback2Low = recentSwings[idx+3].Price;
                     
                     int h1Index = recentSwings[idx+2].Index;
                     int pullback1Index = recentSwings[idx+1].Index;
@@ -378,9 +376,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                     !recentSwings[idx+2].IsHigh && recentSwings[idx+3].IsHigh)
                 {
                     float initialLow = recentSwings[idx].Price;
-                    float pullback1High = recentSwings[idx+1].Price;
                     float l1Low = recentSwings[idx+2].Price;
-                    float pullback2High = recentSwings[idx+3].Price;
                     
                     int l1Index = recentSwings[idx+2].Index;
                     int pullback1Index = recentSwings[idx+1].Index;
