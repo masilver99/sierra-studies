@@ -54,7 +54,7 @@ SCDLLName("Al Brooks Second Entry Indicator");
     - Al Brooks "Reading Price Charts Bar by Bar"
     - Price Action Trading methodology
     
-    AUTHOR: Based on Al Brooks and Ali's trading teachings
+    AUTHOR: Based on Al Brooks' trading teachings
     VERSION: 1.0
     DATE: 2026-02-18
 */
@@ -141,6 +141,8 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
     SCInputRef Input_ShowH1L1 = sc.Input[5];
     SCInputRef Input_ShowH2L2 = sc.Input[6];
     SCInputRef Input_RequireEMATest = sc.Input[7];
+    SCInputRef Input_EMATestTicks = sc.Input[8];
+    SCInputRef Input_MaxBarsAfterPullback = sc.Input[9];
     
     if (sc.SetDefaults)
     {
@@ -222,6 +224,16 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
         Input_RequireEMATest.SetYesNo(true);
         Input_RequireEMATest.SetDescription("Only signal when pullback tests the EMA (Al Brooks' preferred setup).");
         
+        Input_EMATestTicks.Name = "EMA Test Distance (Ticks)";
+        Input_EMATestTicks.SetInt(10);
+        Input_EMATestTicks.SetIntLimits(1, 100);
+        Input_EMATestTicks.SetDescription("Maximum distance in ticks from EMA to consider it a valid test.");
+        
+        Input_MaxBarsAfterPullback.Name = "Max Bars After Pullback for Signal";
+        Input_MaxBarsAfterPullback.SetInt(10);
+        Input_MaxBarsAfterPullback.SetIntLimits(1, 50);
+        Input_MaxBarsAfterPullback.SetDescription("Maximum bars after pullback completion to look for entry signal.");
+        
         return;
     }
     
@@ -236,6 +248,8 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
     const bool showH1L1 = Input_ShowH1L1.GetYesNo();
     const bool showH2L2 = Input_ShowH2L2.GetYesNo();
     const bool requireEMATest = Input_RequireEMATest.GetYesNo();
+    const int emaTestTicks = Input_EMATestTicks.GetInt();
+    const int maxBarsAfterPullback = Input_MaxBarsAfterPullback.GetInt();
     
     // Manual loop through bars
     for (int i = sc.UpdateStartIndex; i < sc.ArraySize; i++)
@@ -311,7 +325,6 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                     if (h1High > initialHigh)
                     {
                         // Check pullback duration
-                        int pullback1Duration = h1Index - pullback1Index;
                         int pullback2Duration = pullback2Index - h1Index;
                         
                         if (pullback2Duration >= minPullbackBars && pullback2Duration <= maxPullbackBars)
@@ -325,7 +338,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                                 for (int k = pullback1Index; k <= pullback2Index; k++)
                                 {
                                     float distToEMA = std::abs(sc.Low[k] - Subgraph_EMA[k]);
-                                    if (distToEMA <= sc.TickSize * 10)  // Within 10 ticks of EMA
+                                    if (distToEMA <= sc.TickSize * emaTestTicks)
                                     {
                                         emaTestOk = true;
                                         break;
@@ -334,7 +347,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                             }
                             
                             // Check if current bar could be H2
-                            if (emaTestOk && i >= pullback2Index + 1 && i <= pullback2Index + 10)
+                            if (emaTestOk && i >= pullback2Index + 1 && i <= pullback2Index + maxBarsAfterPullback)
                             {
                                 // H2 should make higher high than H1
                                 if (sc.High[i] > h1High)
@@ -377,7 +390,6 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                     if (l1Low < initialLow)
                     {
                         // Check pullback duration
-                        int pullback1Duration = l1Index - pullback1Index;
                         int pullback2Duration = pullback2Index - l1Index;
                         
                         if (pullback2Duration >= minPullbackBars && pullback2Duration <= maxPullbackBars)
@@ -391,7 +403,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                                 for (int k = pullback1Index; k <= pullback2Index; k++)
                                 {
                                     float distToEMA = std::abs(sc.High[k] - Subgraph_EMA[k]);
-                                    if (distToEMA <= sc.TickSize * 10)  // Within 10 ticks of EMA
+                                    if (distToEMA <= sc.TickSize * emaTestTicks)
                                     {
                                         emaTestOk = true;
                                         break;
@@ -400,7 +412,7 @@ SCSFExport scsf_SecondEntryIndicator(SCStudyInterfaceRef sc)
                             }
                             
                             // Check if current bar could be L2
-                            if (emaTestOk && i >= pullback2Index + 1 && i <= pullback2Index + 10)
+                            if (emaTestOk && i >= pullback2Index + 1 && i <= pullback2Index + maxBarsAfterPullback)
                             {
                                 // L2 should make lower low than L1
                                 if (sc.Low[i] < l1Low)
