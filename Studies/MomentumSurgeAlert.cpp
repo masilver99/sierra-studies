@@ -7,9 +7,10 @@
 SCDLLName("Momentum Surge Alert");
 
 // Detects rapid price movement accompanied by high volume and sounds a configurable alert.
-// Two detection modes:
-//   0 - Standard Deviation (z-score) based
-//   1 - Fixed Threshold based
+// Three detection modes:
+//   0 - Standard Deviation (z-score) based on bar OHLCV data
+//   1 - Fixed Threshold based on bar OHLCV data
+//   2 - Tick Window based on individual trade ticks (most accurate / real-time)
 SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
 {
     // Subgraph references
@@ -28,12 +29,18 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     SCInputRef In_AlertOncePerBar       = sc.Input[7];
     SCInputRef In_MinRangeTicksMode1    = sc.Input[8];
     SCInputRef In_CooldownBars          = sc.Input[9];
+    // Tick Window mode (Mode 2) inputs
+    SCInputRef In_TickWindowSize        = sc.Input[10];
+    SCInputRef In_TickRangeThreshold    = sc.Input[11];
+    SCInputRef In_TickVolumeThreshold   = sc.Input[12];
 
     if (sc.SetDefaults)
     {
         sc.GraphName        = "Momentum Surge Alert";
         sc.StudyDescription = "Detects rapid price movement with high volume and sounds a configurable alert. "
-                              "Supports z-score (Standard Deviation) mode and Fixed Threshold mode.";
+                              "Mode 0: z-score of bar range/volume vs rolling average. "
+                              "Mode 1: fixed bar range and volume thresholds. "
+                              "Mode 2 (Tick Window): analyzes individual trade ticks for real-time intra-bar detection.";
         sc.AutoLoop   = 1;
         sc.GraphRegion = 0; // Overlay on price chart so the alert dot appears on price
 
@@ -56,7 +63,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
 
         // Detection mode dropdown
         In_DetectionMode.Name = "Detection Mode";
-        In_DetectionMode.SetCustomInputStrings("Standard Deviation;Fixed Threshold");
+        In_DetectionMode.SetCustomInputStrings("Standard Deviation;Fixed Threshold;Tick Window");
         In_DetectionMode.SetCustomInputIndex(0);
 
         // Mode 1 – Standard Deviation settings
@@ -99,6 +106,19 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         In_CooldownBars.SetInt(5);
         In_CooldownBars.SetIntLimits(0, 10000);
 
+        // Mode 2 – Tick Window settings
+        In_TickWindowSize.Name = "Tick Window Size (Mode 2 - number of ticks to analyse)";
+        In_TickWindowSize.SetInt(100);
+        In_TickWindowSize.SetIntLimits(2, 10000);
+
+        In_TickRangeThreshold.Name = "Tick Range Threshold (Ticks, Mode 2)";
+        In_TickRangeThreshold.SetInt(10);
+        In_TickRangeThreshold.SetIntLimits(1, 100000);
+
+        In_TickVolumeThreshold.Name = "Tick Volume Threshold (Mode 2)";
+        In_TickVolumeThreshold.SetInt(2000);
+        In_TickVolumeThreshold.SetIntLimits(1, 2000000000);
+
         return;
     }
 
@@ -115,6 +135,9 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     const bool alertOncePerBar     = (In_AlertOncePerBar.GetYesNo() != 0);
     const int  minRangeTicksMode1  = In_MinRangeTicksMode1.GetInt();
     const int  cooldownBars        = In_CooldownBars.GetInt();
+    const int  tickWindowSize      = In_TickWindowSize.GetInt();
+    const int  tickRangeThreshold  = In_TickRangeThreshold.GetInt();
+    const int  tickVolThreshold    = In_TickVolumeThreshold.GetInt();
 
     // Persistent state
     // [0] = last bar index that fired an alert (-1 means never)
@@ -132,8 +155,9 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         lastProcessedIndex = -1;
     }
 
-    // Guard: need at least lookbackPeriod bars before the current bar
-    if (sc.Index < lookbackPeriod)
+    // Guard: bar-based modes need at least lookbackPeriod bars loaded before the current bar.
+    // Tick Window mode (2) collects raw ticks and does not require a bar lookback.
+    if (detectionMode != 2 && sc.Index < lookbackPeriod)
     {
         SG_AlertSignal[sc.Index]      = 0.0f;
         SG_PriceRangeZScore[sc.Index] = 0.0f;
@@ -158,7 +182,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     if (detectionMode == 0)
     {
         // ------------------------------------------------------------------
-        // Mode 1: Standard Deviation (z-score) based
+        // Mode 0: Standard Deviation (z-score) based on bar OHLCV data
         // ------------------------------------------------------------------
 
         // Compute rolling mean and std dev over [sc.Index - lookbackPeriod, sc.Index - 1]
@@ -205,10 +229,10 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
             triggered = true;
         }
     }
-    else
+    else if (detectionMode == 1)
     {
         // ------------------------------------------------------------------
-        // Mode 2: Fixed Threshold based
+        // Mode 1: Fixed Threshold based on bar OHLCV data
         // ------------------------------------------------------------------
         const float minRangePrice = static_cast<float>(fixedRangeTicks) * tickSize;
 
@@ -220,7 +244,67 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     }
 
     // -----------------------------------------------------------------------
-    // Write z-score subgraphs (0 in Mode 2)
+    // Mode 2 (Tick Window): uses sc.GetNthTick() to examine individual trades
+    // across recent bars, giving real-time intra-bar sensitivity rather than
+    // waiting for a bar close.
+    // -----------------------------------------------------------------------
+    if (detectionMode == 2)
+    {
+        float    minTickPrice    = FLT_MAX;
+        float    maxTickPrice    = -FLT_MAX;
+        double   totalTickVolume = 0.0;
+        int      ticksCollected  = 0;
+
+        s_SCTemporalTickDataRecord tickData;
+
+        // Walk backward bar by bar, collecting ticks until we have tickWindowSize ticks.
+        for (int barIdx = sc.Index; barIdx >= 0 && ticksCollected < tickWindowSize; --barIdx)
+        {
+            // Count ticks in this bar (iterate forward until GetNthTick fails).
+            int numTicksInBar = 0;
+            while (sc.GetNthTick(barIdx, numTicksInBar, tickData))
+                ++numTicksInBar;
+
+            if (numTicksInBar == 0)
+                continue;
+
+            // Collect from the last tick in this bar backward so we stay in time order.
+            for (int t = numTicksInBar - 1; t >= 0 && ticksCollected < tickWindowSize; --t)
+            {
+                if (sc.GetNthTick(barIdx, t, tickData))
+                {
+                    if (tickData.Price < minTickPrice) minTickPrice = tickData.Price;
+                    if (tickData.Price > maxTickPrice) maxTickPrice = tickData.Price;
+                    totalTickVolume += tickData.Volume;
+                    ++ticksCollected;
+                }
+            }
+        }
+
+        // Need at least 2 ticks to compute a meaningful range.
+        if (ticksCollected < 2)
+        {
+            SG_AlertSignal[sc.Index]      = 0.0f;
+            SG_PriceRangeZScore[sc.Index] = 0.0f;
+            SG_VolumeZScore[sc.Index]     = 0.0f;
+            return;
+        }
+
+        const float tickRange         = maxTickPrice - minTickPrice;
+        const float minRangePrice     = static_cast<float>(tickRangeThreshold) * tickSize;
+
+        // Reuse subgraphs: plot tick range in ticks and raw tick volume for diagnostics.
+        priceRangeZScore = (tickSize > 0.0f) ? (tickRange / tickSize) : 0.0f;
+        volumeZScore     = static_cast<float>(totalTickVolume);
+
+        triggered = (tickRange >= minRangePrice &&
+                     totalTickVolume >= static_cast<double>(tickVolThreshold));
+    }
+
+    // -----------------------------------------------------------------------
+    // Write diagnostic subgraphs.
+    // Modes 0/1: price range z-score and volume z-score.
+    // Mode 2: tick range (in ticks) and total tick volume over the window.
     // -----------------------------------------------------------------------
     SG_PriceRangeZScore[sc.Index] = priceRangeZScore;
     SG_VolumeZScore[sc.Index]     = volumeZScore;
