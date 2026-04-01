@@ -53,13 +53,13 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         SG_AlertSignal.PrimaryColor = RGB(255, 255, 0);
         SG_AlertSignal.LineWidth    = 5;
 
-        // Z-score lines – hidden by default (different scale from price)
-        SG_PriceRangeZScore.Name         = "Price Range Z-Score";
+        // Diagnostic metrics – hidden by default (different scale from price)
+        SG_PriceRangeZScore.Name         = "Range Metric";
         SG_PriceRangeZScore.DrawStyle    = DRAWSTYLE_IGNORE;
         SG_PriceRangeZScore.PrimaryColor = RGB(0, 200, 200);
         SG_PriceRangeZScore.LineWidth    = 1;
 
-        SG_VolumeZScore.Name         = "Volume Z-Score";
+        SG_VolumeZScore.Name         = "Volume Metric";
         SG_VolumeZScore.DrawStyle    = DRAWSTYLE_IGNORE;
         SG_VolumeZScore.PrimaryColor = RGB(200, 0, 200);
         SG_VolumeZScore.LineWidth    = 1;
@@ -265,9 +265,19 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     // Mode 2 (Tick Window): uses sc.GetNthTick() to examine individual trades
     // across recent bars, giving real-time intra-bar sensitivity rather than
     // waiting for a bar close.
+    // During a full recalculation, skip all bars except the most recent to
+    // avoid expensive repeated GetNthTick scanning for every historical bar.
     // -----------------------------------------------------------------------
     if (detectionMode == 2)
     {
+        if (sc.IsFullRecalculation && sc.Index < sc.ArraySize - 1)
+        {
+            SG_AlertSignal[sc.Index]      = 0.0f;
+            SG_PriceRangeZScore[sc.Index] = 0.0f;
+            SG_VolumeZScore[sc.Index]     = 0.0f;
+            return;
+        }
+
         float    minTickPrice    = FLT_MAX;
         float    maxTickPrice    = -FLT_MAX;
         double   totalTickVolume = 0.0;
@@ -367,7 +377,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
 
         // Update persistent state
         lastAlertBarIndex = sc.Index;
-        cooldownRemaining = cooldownBars;
+        cooldownRemaining = cooldownBars + 1;
     }
     else
     {
