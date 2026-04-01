@@ -155,9 +155,9 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         lastProcessedIndex = -1;
     }
 
-    // Guard: bar-based modes need at least lookbackPeriod bars loaded before the current bar.
+    // Guard: z-score mode (0) needs at least lookbackPeriod bars loaded before the current bar.
     // Tick Window mode (2) collects raw ticks and does not require a bar lookback.
-    if (detectionMode != 2 && sc.Index < lookbackPeriod)
+    if (detectionMode == 0 && sc.Index < lookbackPeriod)
     {
         SG_AlertSignal[sc.Index]      = 0.0f;
         SG_PriceRangeZScore[sc.Index] = 0.0f;
