@@ -3,6 +3,7 @@
 #endif
 #include "sierrachart.h"
 #include <cfloat>
+#include <cfloat>
 #include <cmath>
 
 SCDLLName("Momentum Surge Alert");
