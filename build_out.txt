@@ -1,0 +1,9 @@
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.28
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+MitigationTrader.cpp
+   Creating library D:\dev\SierraChart\Studies\BuildFiles\MitigationTrader.lib and object D:\dev\SierraChart\Studies\BuildFiles\MitigationTrader.exp
+Generating code
+Finished generating code

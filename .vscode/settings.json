@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^powershell -NoLogo -Command \"Get-ChildItem -Path 'C:\\\\SierraChart\\\\ACS_Source' -Recurse -Filter '\\*\\.h' \\| Select-String -Pattern 'SCDateTime' \\| Select-Object -First 20\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^powershell -NoLogo -Command \"Select-String -Path 'C:\\\\SierraChart\\\\ACS_Source\\\\\\*\\*\\\\\\*\\.h' -Pattern 'class SCDateTime' -SimpleMatch \\| Select-Object -First 10\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
