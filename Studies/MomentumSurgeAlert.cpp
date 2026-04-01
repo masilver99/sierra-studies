@@ -1,8 +1,7 @@
 #ifndef NOMINMAX
-#define NOMINMAX
+#define NOMINMAX 
 #endif
 #include "sierrachart.h"
-#include <cfloat>
 #include <cfloat>
 #include <cmath>
 
@@ -19,6 +18,8 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     SCSubgraphRef SG_AlertSignal    = sc.Subgraph[0];
     SCSubgraphRef SG_PriceRangeZScore = sc.Subgraph[1];
     SCSubgraphRef SG_VolumeZScore   = sc.Subgraph[2];
+    SCSubgraphRef SG_BuyMark        = sc.Subgraph[3];
+    SCSubgraphRef SG_SellMark       = sc.Subgraph[4];
 
     // Input references
     SCInputRef In_DetectionMode         = sc.Input[0];
@@ -62,6 +63,19 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         SG_VolumeZScore.DrawStyle    = DRAWSTYLE_IGNORE;
         SG_VolumeZScore.PrimaryColor = RGB(200, 0, 200);
         SG_VolumeZScore.LineWidth    = 1;
+
+        // Directional buy/sell marks
+        SG_BuyMark.Name         = "Buy Signal";
+        SG_BuyMark.DrawStyle    = DRAWSTYLE_TRIANGLE_UP;
+        SG_BuyMark.PrimaryColor = RGB(0, 200, 0);
+        SG_BuyMark.LineWidth    = 5;
+        SG_BuyMark.DrawZeros    = 0;
+
+        SG_SellMark.Name         = "Sell Signal";
+        SG_SellMark.DrawStyle    = DRAWSTYLE_TRIANGLE_DOWN;
+        SG_SellMark.PrimaryColor = RGB(200, 0, 0);
+        SG_SellMark.LineWidth    = 5;
+        SG_SellMark.DrawZeros    = 0;
 
         // Detection mode dropdown
         In_DetectionMode.Name = "Detection Mode";
@@ -127,7 +141,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     // -----------------------------------------------------------------------
     // Read inputs
     // -----------------------------------------------------------------------
-    const int  detectionMode       = In_DetectionMode.GetCustomInputIndex();
+    const int  detectionMode       = In_DetectionMode.GetIndex();
     const int  lookbackPeriod      = In_LookbackPeriod.GetInt();
     const float priceRangeZThresh  = In_PriceRangeZThreshold.GetFloat();
     const float volumeZThresh      = In_VolumeZThreshold.GetFloat();
@@ -164,6 +178,8 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         SG_AlertSignal[sc.Index]      = 0.0f;
         SG_PriceRangeZScore[sc.Index] = 0.0f;
         SG_VolumeZScore[sc.Index]     = 0.0f;
+        SG_BuyMark[sc.Index]          = 0.0f;
+        SG_SellMark[sc.Index]         = 0.0f;
         return;
     }
 
@@ -257,38 +273,34 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         double   totalTickVolume = 0.0;
         int      ticksCollected  = 0;
 
-        s_SCTemporalTickDataRecord tickData;
+        c_SCTimeAndSalesArray tsArray;
+        sc.GetTimeAndSales(tsArray);
+        const int tsCount = tsArray.Size();
 
-        // Walk backward bar by bar, collecting ticks until we have tickWindowSize ticks.
-        for (int barIdx = sc.Index; barIdx >= 0 && ticksCollected < tickWindowSize; --barIdx)
+        if (tsCount > 0)
         {
-            // Count ticks in this bar (iterate forward until GetNthTick fails).
-            int numTicksInBar = 0;
-            while (sc.GetNthTick(barIdx, numTicksInBar, tickData))
-                ++numTicksInBar;
+            // Walk backward from most recent tick, collecting up to tickWindowSize ticks.
+            const int startIdx = tsCount - 1;
+            const int limit = std::max(0, tsCount - tickWindowSize);
 
-            if (numTicksInBar == 0)
-                continue;
-
-            // Collect from the last tick in this bar backward so we stay in time order.
-            for (int t = numTicksInBar - 1; t >= 0 && ticksCollected < tickWindowSize; --t)
+            for (int t = startIdx; t >= limit; --t)
             {
-                if (sc.GetNthTick(barIdx, t, tickData))
-                {
-                    if (tickData.Price < minTickPrice) minTickPrice = tickData.Price;
-                    if (tickData.Price > maxTickPrice) maxTickPrice = tickData.Price;
-                    totalTickVolume += tickData.Volume;
-                    ++ticksCollected;
-                }
+                const s_TimeAndSales& tick = tsArray[t];
+                if (tick.Price < minTickPrice) minTickPrice = tick.Price;
+                if (tick.Price > maxTickPrice) maxTickPrice = tick.Price;
+                totalTickVolume += tick.Volume;
+                ++ticksCollected;
             }
         }
 
         // Need at least 2 ticks to compute a meaningful range.
-        if (ticksCollected < 2)
+        if (ticksCollected < 2) 
         {
             SG_AlertSignal[sc.Index]      = 0.0f;
             SG_PriceRangeZScore[sc.Index] = 0.0f;
             SG_VolumeZScore[sc.Index]     = 0.0f;
+            SG_BuyMark[sc.Index]          = 0.0f;
+            SG_SellMark[sc.Index]         = 0.0f;
             return;
         }
 
@@ -336,6 +348,20 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         // Plot the alert dot on the bar's high
         SG_AlertSignal[sc.Index] = 1.0f;
 
+        // Directional buy/sell mark: triangle placed at the close price (alert price point).
+        // Bullish bar → green triangle up; bearish bar → red triangle down.
+        const bool isBullish = (sc.Close[sc.Index] >= sc.Open[sc.Index]);
+        if (isBullish)
+        {
+            SG_BuyMark[sc.Index]  = sc.Close[sc.Index];
+            SG_SellMark[sc.Index] = 0.0f;
+        }
+        else
+        {
+            SG_BuyMark[sc.Index]  = 0.0f;
+            SG_SellMark[sc.Index] = sc.Close[sc.Index];
+        }
+
         // Sound the configured Sierra Chart alert
         sc.SetAlert(alertNumber);
 
@@ -346,5 +372,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
     else
     {
         SG_AlertSignal[sc.Index] = 0.0f;
+        SG_BuyMark[sc.Index]     = 0.0f;
+        SG_SellMark[sc.Index]    = 0.0f;
     }
 }
