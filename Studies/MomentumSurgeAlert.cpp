@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "sierrachart.h"
+#include <cfloat>
 #include <cmath>
 
 SCDLLName("Momentum Surge Alert");
@@ -66,7 +67,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         In_DetectionMode.SetCustomInputStrings("Standard Deviation;Fixed Threshold;Tick Window");
         In_DetectionMode.SetCustomInputIndex(0);
 
-        // Mode 1 – Standard Deviation settings
+        // Mode 0 – Standard Deviation settings
         In_LookbackPeriod.Name = "Lookback Period (bars)";
         In_LookbackPeriod.SetInt(50);
         In_LookbackPeriod.SetIntLimits(2, 5000);
@@ -79,7 +80,7 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         In_VolumeZThreshold.SetFloat(2.0f);
         In_VolumeZThreshold.SetFloatLimits(0.1f, 20.0f);
 
-        // Mode 2 – Fixed Threshold settings
+        // Mode 1 – Fixed Threshold settings
         In_FixedRangeTicks.Name = "Fixed Range Threshold (Ticks)";
         In_FixedRangeTicks.SetInt(20);
         In_FixedRangeTicks.SetIntLimits(1, 100000);
@@ -96,8 +97,8 @@ SCSFExport scsf_MomentumSurgeAlert(SCStudyInterfaceRef sc)
         In_AlertOncePerBar.Name = "Alert Only Once Per Bar";
         In_AlertOncePerBar.SetYesNo(1);
 
-        // Mode 1 minimum tick floor to avoid false positives
-        In_MinRangeTicksMode1.Name = "Minimum Bar Range (Ticks) for Mode 1";
+        // Mode 0 minimum tick floor to avoid false positives
+        In_MinRangeTicksMode1.Name = "Minimum Bar Range (Ticks) for Standard Deviation Mode";
         In_MinRangeTicksMode1.SetInt(4);
         In_MinRangeTicksMode1.SetIntLimits(0, 100000);
 
