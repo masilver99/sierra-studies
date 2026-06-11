@@ -55,7 +55,7 @@ SCSFExport scsf_AverageBarOverlap(SCStudyInterfaceRef sc)
 
     // Compute the per-bar overlap for this bar and store it in the working subgraph.
     // For the very first bar there is no prior bar, so overlap is defined as zero.
-    if (Index < 1)
+    if (Index == 0)
     {
         Subgraph_PerBarOverlap[Index] = 0.0f;
     }
