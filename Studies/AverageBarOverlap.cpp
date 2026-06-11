@@ -54,26 +54,27 @@ SCSFExport scsf_AverageBarOverlap(SCStudyInterfaceRef sc)
     const int Index = sc.Index;
 
     // Compute the per-bar overlap for this bar and store it in the working subgraph.
-    // When there is no prior bar, overlap is zero.
+    // For the very first bar there is no prior bar, so overlap is defined as zero.
     if (Index < 1)
     {
         Subgraph_PerBarOverlap[Index] = 0.0f;
-        Subgraph_AvgOverlap[Index]    = 0.0f;
-        return;
     }
+    else
+    {
+        const float CurrentHigh = sc.High[Index];
+        const float CurrentLow  = sc.Low[Index];
+        const float PriorHigh   = sc.High[Index - 1];
+        const float PriorLow    = sc.Low[Index - 1];
 
-    const float CurrentHigh = sc.High[Index];
-    const float CurrentLow  = sc.Low[Index];
-    const float PriorHigh   = sc.High[Index - 1];
-    const float PriorLow    = sc.Low[Index - 1];
-
-    const float OverlapHigh = (CurrentHigh < PriorHigh) ? CurrentHigh : PriorHigh;
-    const float OverlapLow  = (CurrentLow  > PriorLow)  ? CurrentLow  : PriorLow;
-    Subgraph_PerBarOverlap[Index] =
-        (OverlapHigh > OverlapLow) ? (OverlapHigh - OverlapLow) : 0.0f;
+        const float OverlapHigh = (CurrentHigh < PriorHigh) ? CurrentHigh : PriorHigh;
+        const float OverlapLow  = (CurrentLow  > PriorLow)  ? CurrentLow  : PriorLow;
+        Subgraph_PerBarOverlap[Index] =
+            (OverlapHigh > OverlapLow) ? (OverlapHigh - OverlapLow) : 0.0f;
+    }
 
     // Compute the simple moving average of per-bar overlap values using the
     // built-in Sierra Chart function. This operates on the already-populated
     // Subgraph_PerBarOverlap array, keeping each bar's work O(1).
+    // Called unconditionally so the output array is always populated correctly.
     sc.SimpleMovAvg(Subgraph_PerBarOverlap, Subgraph_AvgOverlap, In_LookbackPeriod.GetInt());
 }
